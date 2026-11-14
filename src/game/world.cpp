@@ -1,5 +1,6 @@
 #include "world.h"
 
+#include <xmmintrin.h>
 #include <cmath>
 #include <cstdint>
 #include <cstring>

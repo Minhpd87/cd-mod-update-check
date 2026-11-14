@@ -2080,6 +2080,10 @@ namespace trinity::game
     inline constexpr uintptr_t kOff_FriendlyComp_Entries = 0x30;
     inline constexpr uintptr_t kOff_FriendlyEntry_Record = 0x08;
     inline constexpr uintptr_t kOff_FriendlyRecord_Value = 0x08;
+    // PE 3576 (live-verified 2026-11-08 on Renee): u32 time of the last greet,
+    // set by the greet that grants trust; the next greet is offered only after
+    // a cooldown measured from it. 0 = greet available immediately.
+    inline constexpr uintptr_t kOff_FriendlyRecord_GreetTime = 0x30;
 
     inline constexpr const char* kSig_FriendlySetNpc =
         "4C 8B DC 53 55 56 57 41 56 41 57 48 83 EC 68 48 8B FA 48 8B F1 0F B7 42 04";
@@ -2152,6 +2156,27 @@ namespace trinity::game
     // MinHook's 5-byte copy cannot disturb any argument home.
     inline constexpr const char* kSig_FriendlyApplyThunk3460 =
         "E9 4B B0 CE 09";
+
+    // PE 3576 (live-verified 2026-11-08 with a hardware write watchpoint on
+    // Turnali's record + .pdata unwind): a gift/talk gain is not applied as a
+    // delta any more. The server drains a queue of friendly ops; each op
+    // carries the FULL new 0x78-byte record (value at +0x08, already old+5)
+    // and is stored by one of two setters on the friendly component:
+    //     1429E79EE  mov r8,rdx ; movzx edx,[rbx+8] ; call 14207D2A0 (tagged)
+    //                jmp +5     ; call 14207CCF0 (thunk -> 14C498F80)
+    //                add rdi,8 ; cmp rdi,r15        <- next op
+    // Both setters end in the same inlined "overwrite existing element" copy
+    // (rbx = 1-element container, [rbx] = current record, rdi = new record).
+    // Scaling the new value there - before the copy - is what the save keeps
+    // (direct ledger writes are rebuilt away on reload; this one survived).
+    inline constexpr const char* kSig_FriendlyOpApplyLoop =
+        "4C 8B C2 0F B7 53 08 E8 ?? ?? ?? ?? EB 05 E8 ?? ?? ?? ?? 48 83 C7 08 49 3B FF";
+    // The overwrite copy inside each setter (first 9 bytes are replaced by the
+    // jmp to the scaling cave and re-executed there).
+    inline constexpr uint8_t kFriendlyStoreSite[] = {
+        0xC5, 0xFC, 0x10, 0x0F, 0xC5, 0xFC, 0x10, 0x57, 0x20, 0xC5, 0xFC, 0x10, 0x5F, 0x40,
+        0xC5, 0xF8, 0x10, 0x67, 0x60, 0xC5, 0xFB, 0x10, 0x47, 0x70, 0x48, 0x8B, 0x03,
+        0xC5, 0xFC, 0x11, 0x08 };
 
     inline constexpr const char* kSig_FriendlyRealmWriter3460 =
         "48 89 5C 24 18 4C 89 4C 24 20 48 89 54 24 10 48 89 4C 24 08 "

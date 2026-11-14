@@ -58,6 +58,7 @@ endif()
 add_library(Trinity SHARED
     src/dllmain.cpp
     src/core/mod.cpp
+    src/core/live.cpp
     src/core/settings.cpp
     src/core/localization.cpp
     src/core/version_detect.cpp
@@ -156,3 +157,4 @@ if(BUILD_TESTING)
         set_tests_properties(TrinityDyeEditorTests TrinityCharacterIdentityTests PROPERTIES TIMEOUT 90)
     endif()
 endif()
+

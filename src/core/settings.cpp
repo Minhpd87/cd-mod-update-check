@@ -121,6 +121,8 @@ namespace trinity
             else if (!strcmp(key, "trustMult"))           vals.trustMult           = atoi(val) != 0;
             else if (!strcmp(key, "trustMultVal"))        vals.trustMultVal        = strtof(val, nullptr);
             else if (!strcmp(key, "maxTrust"))            vals.maxTrust            = atoi(val) != 0;
+            else if (!strcmp(key, "instantGreet"))        vals.instantGreet        = atoi(val) != 0;
+            else if (!strcmp(key, "freeCraft"))           vals.freeCraft           = atoi(val) != 0;
             else if (!strcmp(key, "petSlotLimit"))        vals.petSlotLimit        = atoi(val) != 0;
             else if (!strcmp(key, "petSlotLimitVal"))     vals.petSlotLimitVal     = atoi(val);
             else if (!strcmp(key, "invSlotSize"))         vals.invSlotSize         = atoi(val) != 0;
@@ -300,6 +302,8 @@ namespace trinity
         st.trustMult     = vals.trustMult;
         st.trustMultVal  = ClampF(vals.trustMultVal, 1.0f, 100.0f);
         st.maxTrust      = vals.maxTrust;
+        st.instantGreet  = vals.instantGreet;
+        st.freeCraft     = vals.freeCraft;
         st.petSlotLimit    = vals.petSlotLimit;
         st.petSlotLimitVal = ClampI(vals.petSlotLimitVal, 30, 999);
         st.invSlotSize     = vals.invSlotSize;
@@ -404,6 +408,8 @@ namespace trinity
                 "trustMult=%d\n"
                 "trustMultVal=%.3f\n"
                 "maxTrust=%d\n"
+                "instantGreet=%d\n"
+                "freeCraft=%d\n"
                 "petSlotLimit=%d\n"
                 "petSlotLimitVal=%d\n"
                 "invSlotSize=%d\n"
@@ -493,6 +499,8 @@ namespace trinity
                 st.trustMult ? 1 : 0,
                 st.trustMultVal,
                 st.maxTrust ? 1 : 0,
+                st.instantGreet ? 1 : 0,
+                st.freeCraft ? 1 : 0,
                 st.petSlotLimit ? 1 : 0,
                 st.petSlotLimitVal,
                 st.invSlotSize ? 1 : 0,

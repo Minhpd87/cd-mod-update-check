@@ -18,6 +18,7 @@
 #include "../core/state.h"
 #include "../core/version.h"
 #include "../core/localization.h"
+#include "../core/logger.h"
 #include "../hooks/xinput_hook.h"
 
 namespace trinity::ui
@@ -416,27 +417,65 @@ namespace trinity::ui
             titleSize = 32.0f * g_scale;
         }
 
-        g_fontBody = LoadFontWithFallbacks(primaryBody,
-            hasYahei ? yaheiPath : nullptr,
-            hasMalgun ? malgunPath : nullptr,
-            hasMeiryo ? meiryoPath : nullptr,
-            bodySize);
+        // The font atlas becomes ONE GPU texture, and D3D12 caps a texture at
+        // 16384 px per side. Merging the full Chinese + Korean (~11k Hangul) +
+        // Japanese ranges into three fonts overflows that at high UI scales
+        // (4K + menu scale 1.2 => 4096x32768). The DX12 backend does not check
+        // texture creation in release builds, so it then copies into a null
+        // texture: DXGI_ERROR_INVALID_CALL -> device removed -> game freezes
+        // seconds after the menu opens. So build the atlas here, check it, and
+        // shed CJK coverage until it fits:
+        //   0 = all CJK sets (previous behaviour)
+        //   1 = only the CJK set the menu language needs
+        //   2 = no CJK
+        constexpr int kMaxTexDim = 16384;
+        const char* lang = st.languageCode;
+        const bool langZh = _strnicmp(lang, "zh", 2) == 0;
+        const bool langKo = _strnicmp(lang, "ko", 2) == 0;
+        const bool langJa = _strnicmp(lang, "ja", 2) == 0;
 
-        g_fontBold = LoadFontWithFallbacks(primaryBold,
-            hasYaheiBd ? yaheibdPath : (hasYahei ? yaheiPath : nullptr),
-            hasMalgunBd ? malgunbdPath : (hasMalgun ? malgunPath : nullptr),
-            hasMeiryoBd ? meiryobdPath : (hasMeiryo ? meiryoPath : nullptr),
-            boldSize);
+        for (int level = 0; level < 3; ++level)
+        {
+            const bool useZh = level == 0 || (level == 1 && langZh);
+            const bool useKo = level == 0 || (level == 1 && langKo);
+            const bool useJa = level == 0 || (level == 1 && langJa);
+            if (level > 0)
+                io.Fonts->Clear();
 
-        g_fontTitle = LoadFontWithFallbacks(primaryTitle,
-            hasYaheiBd ? yaheibdPath : (hasYahei ? yaheiPath : nullptr),
-            hasMalgunBd ? malgunbdPath : (hasMalgun ? malgunPath : nullptr),
-            hasMeiryoBd ? meiryobdPath : (hasMeiryo ? meiryoPath : nullptr),
-            titleSize);
+            g_fontBody = LoadFontWithFallbacks(primaryBody,
+                useZh && hasYahei ? yaheiPath : nullptr,
+                useKo && hasMalgun ? malgunPath : nullptr,
+                useJa && hasMeiryo ? meiryoPath : nullptr,
+                bodySize);
 
-        if (!g_fontBody)  g_fontBody  = io.Fonts->AddFontDefault();
-        if (!g_fontBold)  g_fontBold  = g_fontBody;
-        if (!g_fontTitle) g_fontTitle = g_fontBold;
+            g_fontBold = LoadFontWithFallbacks(primaryBold,
+                useZh ? (hasYaheiBd ? yaheibdPath : (hasYahei ? yaheiPath : nullptr)) : nullptr,
+                useKo ? (hasMalgunBd ? malgunbdPath : (hasMalgun ? malgunPath : nullptr)) : nullptr,
+                useJa ? (hasMeiryoBd ? meiryobdPath : (hasMeiryo ? meiryoPath : nullptr)) : nullptr,
+                boldSize);
+
+            g_fontTitle = LoadFontWithFallbacks(primaryTitle,
+                useZh ? (hasYaheiBd ? yaheibdPath : (hasYahei ? yaheiPath : nullptr)) : nullptr,
+                useKo ? (hasMalgunBd ? malgunbdPath : (hasMalgun ? malgunPath : nullptr)) : nullptr,
+                useJa ? (hasMeiryoBd ? meiryobdPath : (hasMeiryo ? meiryoPath : nullptr)) : nullptr,
+                titleSize);
+
+            if (!g_fontBody)  g_fontBody  = io.Fonts->AddFontDefault();
+            if (!g_fontBold)  g_fontBold  = g_fontBody;
+            if (!g_fontTitle) g_fontTitle = g_fontBold;
+
+            const bool built = io.Fonts->Build();
+            const int texW = io.Fonts->TexWidth, texH = io.Fonts->TexHeight;
+            if (built && texW <= kMaxTexDim && texH <= kMaxTexDim)
+            {
+                if (level > 0)
+                    LOG_WARN("ui: font atlas reduced to fit the GPU texture limit (scale %.2f, %s CJK glyphs, %dx%d).",
+                             g_scale, level == 1 ? "menu-language" : "no", texW, texH);
+                break;
+            }
+            LOG_WARN("ui: font atlas %dx%d exceeds the %d px GPU texture limit at scale %.2f - shedding CJK glyphs.",
+                     texW, texH, kMaxTexDim, g_scale);
+        }
 
         io.FontDefault = g_fontBody;
     }

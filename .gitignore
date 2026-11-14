@@ -68,4 +68,7 @@ tools/live_combat_monitor.py
 scratch/scripts/
 scratch/
 
-/work/
+/work/build-clean/
+build-map/
+build/
+*.log

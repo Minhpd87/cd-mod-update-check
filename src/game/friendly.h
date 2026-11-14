@@ -32,6 +32,14 @@ namespace trinity::game
         // Non-fatal: if the signature does not resolve, Trust Multiplier is
         // disabled and the rest of the mod is unaffected.
         static bool Install();
+        // Reserve the trust-apply cave page near the game image. Call as early
+        // as possible: by Install time the game has usually reserved all the
+        // address space within rel32 reach of its code.
+        static void ReserveCave();
+        // A second RWX page (0x1000) reserved next to the trust cave, within
+        // rel32 of all game code; nullptr if the reservation failed. Owned by
+        // Inventory's Free Crafting hook.
+        static void* SpareCavePage();
         static void Remove();
 
         // Game-thread tick: dynamically enables/disables the underlying hook

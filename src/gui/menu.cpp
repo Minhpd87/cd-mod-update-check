@@ -209,6 +209,8 @@ namespace trinity::gui
                         LOC("Scales each trust gain by this amount (10x on a base +5 = +50). Greet or gift someone once so they appear."));
         changed |= ui::Toggle(LOC("Max Trust (All Relationships)"), &st.maxTrust,
                         LOC("Drives every discovered relationship straight to the game cap (100). Independent of the multiplier above - turn this off if you want the multiplier's scaled gains to show."));
+        changed |= ui::Toggle(LOC("Instant Greet"), &st.instantGreet,
+                        LOC("Removes the wait before you can greet someone again. Each greet still gives its normal trust gain."));
 
         if (changed && st.autoSave)
             Settings::Save();
@@ -2112,6 +2114,9 @@ namespace trinity::gui
         if (ui::IntOption(LOC("Set Max Stack Value"), &st.invStackSizeVal,
                           1, 999999999, 10000, 999999,
                           LOC("Enter custom max stack size using keyboard or arrow keys (Press ENTER to type).")))
+            changed = true;
+        if (ui::Toggle(LOC("Free Crafting"), &st.freeCraft,
+                       LOC("Crafting costs nothing: selecting a recipe at a crafting station adds any missing materials, and whatever a craft uses is given back right after.")))
             changed = true;
 
         if (changed && st.autoSave)

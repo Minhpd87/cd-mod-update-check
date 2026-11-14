@@ -52,6 +52,8 @@ namespace trinity::game
         static uintptr_t GetOwner(int index = 0);
         // Controlled body, independent of whether its character identity is known.
         static uintptr_t GetControlledOwner();
+        // Client-realm (UI-side) character owners, mounts excluded. Returns count.
+        static int GetClientOwners(uintptr_t* out, int max);
         // Counts identified character handles, not internal combat/stat slots.
         static int GetTrackedPlayerCount();
         // Controlled character identity (0..2), or -1 while unknown/unavailable.

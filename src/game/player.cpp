@@ -2280,6 +2280,27 @@ namespace trinity::game
         return g_characterOwners[index].load(std::memory_order_acquire);
     }
 
+    int Player::GetClientOwners(uintptr_t* out, int max)
+    {
+        // Client-realm character owners (no mounts) from the live client
+        // registry scan. The UI reads per-character replicas (e.g. the
+        // ClientSelfFriendlyActorComponent trust ledger) off these, not off
+        // the server owner GetControlledOwner() returns.
+        int n = 0;
+        if (!out || max <= 0) return 0;
+        if (!TryAcquireSRWLockShared(&g_clientStatLock)) return 0;
+        const auto registry = ReadActorRegistry(Dye::ClientRegistryGlobal());
+        if (registry.Same(g_clientStatRegistry))
+            for (const auto& source : g_clientStatSources)
+            {
+                if (n >= max) break;
+                if (!source.binding.owner || source.mount || !ClientStatSourceCurrent(registry, source)) continue;
+                out[n++] = source.binding.owner;
+            }
+        ReleaseSRWLockShared(&g_clientStatLock);
+        return n;
+    }
+
     uintptr_t Player::GetControlledOwner()
     {
         return g_owners[0].load(std::memory_order_acquire);

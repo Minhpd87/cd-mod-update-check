@@ -1,3 +1,4 @@
+#include <intrin.h>
 #include "inventory.h"
 #include "inventory_scan.h"
 
@@ -22,6 +23,7 @@
 #include "native_character_identity.h"
 #include "dye.h"
 #include "item_names.h"
+#include "friendly.h"
 #include "../mem/scanner.h"
 #include "../mem/safe_memory.h"
 #include "../mem/hooks.h"
@@ -45,6 +47,14 @@ namespace trinity::game
     using mem::ReadCString;
 
     inline uintptr_t SlotStride() { return core::GetSlotStride(); }
+
+    namespace
+    {
+        // Free Crafting (defined at the end of this file).
+        void FreeCraftInstall();
+        void FreeCraftRemove();
+        void FreeCraftTick();
+    }
 
     namespace
     {
@@ -371,8 +381,9 @@ namespace trinity::game
             if (!DefForRow(g_itemTableGlobal, typeId, &def)) return false;
             uintptr_t rows = 0;
             uint32_t  count = 0;
-            if (!ReadPtr(def + kOff_ItemDef_Groups + kOff_Vec_Data, &rows)) return false;
-            if (!Read32(def + kOff_ItemDef_Groups + kOff_Vec_Count, &count)) return false;
+            const uintptr_t groupsOff = kOff_ItemDef_Groups + core::GetItemDefLayoutShift();
+            if (!ReadPtr(def + groupsOff + kOff_Vec_Data, &rows)) return false;
+            if (!Read32(def + groupsOff + kOff_Vec_Count, &count)) return false;
             if (rows < kMinPointer || count == 0 || count > 4096) return false;
 
             Category c = kNoCategory;
@@ -1120,7 +1131,7 @@ namespace trinity::game
 
             // 1) pinned offset, or the offset a previous probe discovered
             uintptr_t off = g_iconListOffset.load(std::memory_order_acquire);
-            if (!off) off = kOff_ItemDef_Icons;
+            if (!off) off = kOff_ItemDef_Icons + core::GetItemDefLayoutShift();
             if (ProbeIconListAt(def, off, out, n)) return true;
 
             // 2) adaptive probe (once per session, on the first failure)
@@ -1145,7 +1156,7 @@ namespace trinity::game
                 }
                 // no candidate anywhere - pin the pinned offset so we don't
                 // re-probe every call; icons on this TU resolve differently.
-                g_iconListOffset.store(kOff_ItemDef_Icons, std::memory_order_release);
+                g_iconListOffset.store(kOff_ItemDef_Icons + core::GetItemDefLayoutShift(), std::memory_order_release);
                 // Diagnose the chain: is stringinfo itself readable?
                 {
                     uintptr_t sdef = 0;
@@ -1754,6 +1765,13 @@ namespace trinity::game
                                  uintptr_t* outSlots);
 
         std::atomic<uintptr_t> g_mirrorHolder{ 0 };
+        // PE 3576 (live-verified 2026-11-08): the mirror pack is the copy the
+        // crafting UI counts materials from (a row copied into it by hand made
+        // a greyed-out recipe craftable without a reload). It has no owning
+        // holder, but ScanForMirror finds the BUCKET that points at it; the
+        // bucket's slots pointer is re-read on every use, so it stays right
+        // while the bucket lives. Re-found by a scan when it goes stale.
+        std::atomic<uintptr_t> g_mirrorBucket{ 0 };
         std::atomic<uintptr_t> g_mirrorScanGeneration{ 0 };
         std::atomic<bool>      g_mirrorScanBusy{ false };
         // Copy cache: the multi-copy scan takes seconds and MUST NOT run on
@@ -1914,6 +1932,9 @@ namespace trinity::game
                     if (!sz2) a2 += 0x1000000ULL;
                 }
             }
+
+            if (bucket)
+                g_mirrorBucket.store(bucket, std::memory_order_release);
 
             uintptr_t holder = 0;
             if (bucket)
@@ -3204,6 +3225,7 @@ namespace trinity::game
         if (locGet)
             g_locMgrGlobal = mem::ResolveRipAt(locGet + kOff_LocGet_MovGlobal, 7);
 
+        FreeCraftInstall();
         return true;
     }
 
@@ -3213,6 +3235,7 @@ namespace trinity::game
         // for Game Speed.
         if (g_stackApplied) { SetAllMaxStackSizes(false, 0); g_stackApplied = false; }
         if (g_slotApplied)  { SetAllSlotSizes(false, 0);     g_slotApplied  = false; }
+        FreeCraftRemove();
 
         mem::RemoveHook(&g_qtyTarget);
         if (g_commitPlacementTarget)
@@ -3650,8 +3673,11 @@ namespace trinity::game
 
         // TU 2.04 ItemInfo: _cooltime is a per-row object of three i64 at def+0x1D8;
         // _respawnTimeSeconds is i64 at def+0x220 (-1 = never, left alone).
+        // Both move +8 on TU 2.04.05+ (see core::GetItemDefLayoutShift).
         bool SetAllItemCooldowns204(bool enable)
         {
+            const uintptr_t kCoolOff    = 0x1D8 + core::GetItemDefLayoutShift();
+            const uintptr_t kRespawnOff = 0x220 + core::GetItemDefLayoutShift();
             struct Saved { int64_t cool[3]; int64_t respawn; };
             static std::vector<Saved> s_saved;
             uintptr_t table = 0;
@@ -3667,8 +3693,8 @@ namespace trinity::game
                 {
                     uintptr_t def = 0, cool = 0;
                     if (!DefForRow(g_itemTableGlobal, static_cast<uint16_t>(row), &def)) continue;
-                    Read64(def + 0x220, &s_saved[row].respawn);
-                    if (ReadPtr(def + 0x1D8, &cool) && cool >= kMinPointer)
+                    Read64(def + kRespawnOff, &s_saved[row].respawn);
+                    if (ReadPtr(def + kCoolOff, &cool) && cool >= kMinPointer)
                         for (int k = 0; k < 3; ++k)
                             Read64(cool + k * 8, &s_saved[row].cool[k]);
                 }
@@ -3679,12 +3705,12 @@ namespace trinity::game
                 uintptr_t def = 0, cool = 0;
                 if (!DefForRow(g_itemTableGlobal, static_cast<uint16_t>(row), &def)) continue;
                 const Saved& saved = s_saved[row];
-                if (ReadPtr(def + 0x1D8, &cool) && cool >= kMinPointer)
+                if (ReadPtr(def + kCoolOff, &cool) && cool >= kMinPointer)
                     for (int k = 0; k < 3; ++k)
                         if (saved.cool[k] > 0 && Write64(cool + k * 8, enable ? 0 : saved.cool[k]))
                             any = true;
                 if (saved.respawn > 0)
-                    Write64(def + 0x220, enable ? 0 : saved.respawn);
+                    Write64(def + kRespawnOff, enable ? 0 : saved.respawn);
             }
             return any;
         }
@@ -4146,6 +4172,7 @@ namespace trinity::game
 
     // Defined in the scan section below: warms the parallel-copy cache.
     void PrimePackCopiesFromTick();
+    namespace { void FlushPendingMirrorRows(); } // add-item rows that missed the crafting copy
 
     static void InventoryTickStackSlots()
     {
@@ -4179,6 +4206,12 @@ namespace trinity::game
                 {
                     s_lastCopyPrime = nowC;
                     PrimePackCopiesFromTick();
+                }
+                static ULONGLONG s_lastMirrorFlush = 0;
+                if (nowC - s_lastMirrorFlush > 500)
+                {
+                    s_lastMirrorFlush = nowC;
+                    FlushPendingMirrorRows();
                 }
             }
 
@@ -4344,6 +4377,7 @@ namespace trinity::game
             __except (EXCEPTION_EXECUTE_HANDLER) {}
             __try { InventoryTickRepair(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
             __try { InventoryTickStackSlots(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            __try { FreeCraftTick(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
         }
         __finally { busy.clear(std::memory_order_release); }
     }
@@ -5171,7 +5205,7 @@ namespace trinity::game
                         if (Read16(def + 0x218, &sub))
                             *reinterpret_cast<uint16_t*>(itemVal + kOff_ItemVal_Subtype) = sub;
                         uint16_t maxD = 0;
-                        if (Read16(def + 0x400, &maxD) && maxD > 0)
+                        if (Read16(def + core::GetItemDefMaxEnduranceOffset(), &maxD) && maxD > 0)
                         {
                             *reinterpret_cast<uint16_t*>(itemVal + 0x40) = maxD;
                             *reinterpret_cast<uint16_t*>(itemVal + 0x42) = maxD;
@@ -5359,7 +5393,7 @@ namespace trinity::game
             if (!bucket)
             {
                 uint16_t want = 0;
-                Read16(def + kOff_ItemDef_BucketType, &want);
+                Read16(def + core::GetItemDefBucketTypeOffset(), &want);
                 LOG_WARN("inventory: add[%s] %u: no bucket of type %u in holder",
                          realm, typeId, want);
                 return false;
@@ -5450,6 +5484,51 @@ namespace trinity::game
         int ResolveAllPackCopies(uintptr_t clientPackSlots, uint16_t clientCount,
                                  uintptr_t* outSlots);
 
+        // The mirror pack's slots via the bucket ScanForMirror found, if that
+        // bucket still describes a twin of the client pack.
+        bool MirrorSlotsFromBucket(uintptr_t clientPackSlots, uint16_t clientCount, uintptr_t* outSlots)
+        {
+            const uintptr_t b = g_mirrorBucket.load(std::memory_order_acquire);
+            if (b < kMinPointer) return false;
+            uintptr_t slots = 0; uint16_t t = 0, cnt = 0;
+            if (!Read16(b + kOff_InvBucket_Type, &t) || t != 1 ||
+                !ReadPtr(b + kOff_InvBucket_Slots, &slots) || slots < kMinPointer || slots == clientPackSlots ||
+                !Read16(b + kOff_InvBucket_Count, &cnt) || cnt != clientCount ||
+                !LooksLikeSaveCopyRange(slots, clientPackSlots, clientCount))
+                return false;
+            *outSlots = slots;
+            return true;
+        }
+
+        // Rows written to the client while no mirror was resolvable. Flushed
+        // by the inventory tick once a (re)scan finds the mirror again.
+        // Plain data only: touched from the game thread (add) and the tick.
+        constexpr int kMaxPendingMirrorRows = 32;
+        std::atomic<int> g_pendingMirrorCount{ 0 };
+        uint16_t g_pendingMirrorIdx[kMaxPendingMirrorRows] = {};
+        uint64_t g_pendingMirrorInst[kMaxPendingMirrorRows] = {};
+        ULONGLONG g_lastMirrorRescan = 0;
+
+        void QueuePendingMirrorRow(uint16_t idx, uint64_t inst)
+        {
+            const int n = g_pendingMirrorCount.load(std::memory_order_acquire);
+            for (int i = 0; i < n; ++i)
+                if (g_pendingMirrorIdx[i] == idx) { g_pendingMirrorInst[i] = inst; return; }
+            if (n >= kMaxPendingMirrorRows) return;
+            g_pendingMirrorIdx[n] = idx;
+            g_pendingMirrorInst[n] = inst;
+            g_pendingMirrorCount.store(n + 1, std::memory_order_release);
+        }
+
+        void RequestMirrorRescan(uintptr_t clientPackSlots, uint16_t clientCount)
+        {
+            const ULONGLONG now = GetTickCount64();
+            if (now - g_lastMirrorRescan < 5000) return;
+            g_lastMirrorRescan = now;
+            try { std::thread([clientPackSlots, clientCount] { ScanForMirror(clientPackSlots, clientCount); }).detach(); }
+            catch (...) {}
+        }
+
         int CachedPackCopies(uintptr_t clientPackSlots, uint16_t clientCount,
                              uintptr_t* outSlots)
         {
@@ -5465,6 +5544,16 @@ namespace trinity::game
                 if (!Read64(c, &a) || !Read64(clientPackSlots, &b) || a != b) continue;
                 outSlots[ok++] = c;
             }
+            // The crafting copy: never rely on the anchor-scan cache alone for it.
+            uintptr_t mirror = 0;
+            if (MirrorSlotsFromBucket(clientPackSlots, clientCount, &mirror))
+            {
+                bool dup = false;
+                for (int i = 0; i < ok; ++i) if (outSlots[i] == mirror) { dup = true; break; }
+                if (!dup && ok < kMaxPackCopies) outSlots[ok++] = mirror;
+            }
+            else
+                RequestMirrorRescan(clientPackSlots, clientCount);
             if (ok == 0 && !g_packCopiesBusy.load(std::memory_order_acquire))
             {
                 // find the client pack bucket slots for the worker
@@ -5542,6 +5631,13 @@ namespace trinity::game
         {
             *outSlots = 0; *outCount = 0;
             if (!clientPackSlots || clientCount < 1) return false;
+
+            // 0) the crafting copy via its bucket (cheap, live-verified on 3576)
+            if (MirrorSlotsFromBucket(clientPackSlots, clientCount, outSlots))
+            {
+                *outCount = clientCount;
+                return true;
+            }
 
             // 1) cached holder still valid? (TUs where the mirror has an owner)
             uintptr_t mh = g_mirrorHolder.load(std::memory_order_acquire);
@@ -5641,17 +5737,83 @@ namespace trinity::game
             const uintptr_t cSlot = clientPackSlots + static_cast<uintptr_t>(idx) * stride;
             uint8_t row[0xC8];
             if (!mem::ReadBytes(cSlot, row, sizeof(row))) return false;
+            uint64_t rowInst = 0;
+            memcpy(&rowInst, row + kOff_ItemVal_InstanceId, 8);
+            uintptr_t bucketMirror = 0;
+            MirrorSlotsFromBucket(clientPackSlots, clientCount, &bucketMirror);
             int ok = 0;
+            bool mirrorDone = false;
             for (int i = 0; i < n; ++i)
             {
                 const uintptr_t mSlot = copies[i] + static_cast<uintptr_t>(idx) * stride;
+                uint64_t before = 0;
+                Read64(mSlot + kOff_ItemVal_InstanceId, &before);
                 bool w = true;
                 for (size_t bi = 0; bi < sizeof(row) && w; ++bi)
                     if (!Write8(mSlot + bi, row[bi])) w = false;
-                if (w) ++ok;
+                if (!w) continue;
+                ++ok;
+                if (copies[i] == bucketMirror)
+                {
+                    mirrorDone = true;
+                    // Same used-slot bookkeeping the client bucket gets.
+                    if (before == 0xFFFFFFFFFFFFFFFF && rowInst != 0xFFFFFFFFFFFFFFFF)
+                    {
+                        uint16_t used = 0;
+                        const uintptr_t b = g_mirrorBucket.load(std::memory_order_acquire);
+                        if (Read16(b + kOff_InvBucket_UsedSlots, &used))
+                            Write16(b + kOff_InvBucket_UsedSlots, used + 1);
+                    }
+                }
             }
+            if (!mirrorDone)
+                QueuePendingMirrorRow(idx, rowInst); // the tick retries once the mirror is re-found
             if (outCopies) *outCopies = ok;
             return true; // client row is always written; copies may lag one add
+        }
+
+        // Tick: copy rows that missed the mirror into it once it is resolvable.
+        // A row is only written while the client row still holds the same item
+        // and the mirror row is empty or already that item.
+        void FlushPendingMirrorRows()
+        {
+            const int n = g_pendingMirrorCount.load(std::memory_order_acquire);
+            if (n <= 0) return;
+            const uintptr_t ch = CurrentHolder();
+            uintptr_t cb = 0, slots = 0; uint32_t bn = 0; uint16_t count = 0;
+            if (ch < kMinPointer || !ReadPtr(ch + kOff_InvHolder_Buckets, &cb) || cb < kMinPointer ||
+                !Read32(ch + kOff_InvHolder_Count, &bn) || !bn || bn > 4096) return;
+            for (uint32_t i = 0; i < bn && !slots; ++i)
+            {
+                uintptr_t b = 0; uint16_t t = 0;
+                if (!ReadPtr(cb + static_cast<uintptr_t>(i) * 8, &b) || b < kMinPointer) continue;
+                if (Read16(b + kOff_InvBucket_Type, &t) && t == 1 &&
+                    (!ReadPtr(b + kOff_InvBucket_Slots, &slots) || !Read16(b + kOff_InvBucket_Count, &count)))
+                    slots = 0;
+            }
+            if (slots < kMinPointer || !count) return;
+            uintptr_t mirror = 0;
+            if (!MirrorSlotsFromBucket(slots, count, &mirror))
+            {
+                RequestMirrorRescan(slots, count);
+                return;
+            }
+            const uintptr_t stride = SlotStride();
+            int flushed = 0;
+            for (int i = 0; i < n; ++i)
+            {
+                const uint16_t idx = g_pendingMirrorIdx[i];
+                if (idx >= count) continue;
+                uint64_t cInst = 0, mInst = 0;
+                if (!Read64(slots + idx * stride + kOff_ItemVal_InstanceId, &cInst) || cInst != g_pendingMirrorInst[i]) continue;
+                if (!Read64(mirror + idx * stride + kOff_ItemVal_InstanceId, &mInst)) continue;
+                if (mInst != 0xFFFFFFFFFFFFFFFF && mInst != cInst) continue;
+                int copies = 0;
+                if (SyncMirrorRowAt(slots, count, idx, &copies)) ++flushed;
+            }
+            g_pendingMirrorCount.store(0, std::memory_order_release);
+            if (flushed)
+                LOG_INFO("inventory: %d added row(s) synced into the crafting copy after a mirror rescan.", flushed);
         }
 
         // Direct slot-append with multi-copy propagation (rev >= 3460):
@@ -5708,7 +5870,7 @@ namespace trinity::game
             if (def)
             {
                 uint16_t maxD = 0;
-                if (Read16(def + 0x400, &maxD) && maxD > 0)
+                if (Read16(def + core::GetItemDefMaxEnduranceOffset(), &maxD) && maxD > 0)
                 {
                     *reinterpret_cast<uint16_t*>(itemVal + 0x40) = maxD;
                     *reinterpret_cast<uint16_t*>(itemVal + 0x42) = maxD;
@@ -7871,5 +8033,526 @@ namespace trinity::game
         if (modifiedCount) *modifiedCount = count;
         LOG("inventory: Refined %d bag items to +%d; queued refinement for %d equipped pieces.", count, level, eqQueued);
         return count > 0 || eqQueued > 0;
+    }
+
+    // ---- Free Crafting -------------------------------------------------------
+    // PE 1.0.0.3576, live-verified: the crafting detail panel asks the
+    // "can craft" wrapper about the selected recipe from one call site
+    // (kSig_CraftPanelCanCraftCall), on the game thread - the same thread as
+    // the movement update that drives Inventory::Tick, which does NOT run while
+    // the player stands at a station. So the work cannot wait for a tick: the
+    // call is redirected through hkPanelCanCraft, which reads the recipe's own
+    // definition (exact items @+0x40, stride 0x20; material groups @+0x50,
+    // stride 0x18 - e.g. Meliara's Lesser Elixir 0x34B = Empty Bottle x1,
+    // "Health Reagent" group 0x9A x2, "Catalyst" group 0xB3 x1), compares with
+    // what the pack holds, adds the shortfall through the real add path, and
+    // only then lets the game ask "can craft" - so Make is available at once
+    // and the craft itself runs unmodified.
+    namespace
+    {
+        // lea r9,[rsp+30h] ; movzx r8d,bx ; mov rcx,[rcx+168h] ; call <can-craft> ; movzx esi,al ; mov rdi,[r15+0C8h]
+        constexpr const char* kSig_CraftPanelCanCraftCall =
+            "4C 8D 4C 24 30 44 0F B7 C3 48 8B 89 68 01 00 00 E8 ?? ?? ?? ?? 0F B6 F0 49 8B BF C8 00 00 00";
+        constexpr size_t kOff_CraftPanelCall = 16;
+        // call <recipe lookup> ; mov r12,[rax+50h]
+        constexpr const char* kSig_RecipeLookupCall = "8B DE 89 5D C0 8B D6 E8 ?? ?? ?? ?? 4C 8B 60 50";
+        constexpr size_t kOff_RecipeLookupCall = 7;
+        // call <material-group lookup> ; mov r14,[rax+48h] ; mov ecx,[rax+50h]
+        constexpr const char* kSig_GroupLookupCall = "8B D1 E8 ?? ?? ?? ?? 4C 8B 70 48 8B 48 50";
+        constexpr size_t kOff_GroupLookupCall = 2;
+        // Both lookups open with: mov r11,rsp ; ... ; mov edi,edx ; mov rbx,[rip+table]
+        constexpr size_t kOff_Lookup_MovTable = 0x15;
+
+        constexpr uintptr_t kOff_Table_Count   = 0x08; // u32
+        constexpr uintptr_t kOff_Table_Defs    = 0x58; // def*[]
+        constexpr uintptr_t kOff_Recipe_Items  = 0x40; // {u16 type, ..., i64 qty @8} stride 0x20
+        constexpr uintptr_t kOff_Recipe_Groups = 0x50; // {u16 group, ..., i64 qty @8} stride 0x18
+        constexpr uintptr_t kOff_Group_Members = 0x48; // u16[] + u32 count @+8
+
+        using CanCraft_t = uint8_t(__fastcall*)(void*, void*, uint32_t, void*, void*, void*);
+        CanCraft_t g_origCanCraft   = nullptr;
+        uint8_t*  g_craftCallSite   = nullptr;
+        uint8_t   g_craftCallOrig[5] = {};
+        uintptr_t g_recipeTableGlob = 0;
+        uintptr_t g_groupTableGlob  = 0;
+
+        uintptr_t CallTarget(uintptr_t call)
+        {
+            int32_t rel = 0;
+            if (!mem::ReadBytes(call + 1, &rel, 4)) return 0;
+            return call + 5 + static_cast<intptr_t>(rel);
+        }
+
+        uintptr_t LookupTableGlobal(uintptr_t fn)
+        {
+            uint8_t op[3] = {};
+            if (!fn || !mem::ReadBytes(fn + kOff_Lookup_MovTable, op, 3) ||
+                op[0] != 0x48 || op[1] != 0x8B || op[2] != 0x1D)
+                return 0;
+            return mem::ResolveRipAt(fn + kOff_Lookup_MovTable, 7);
+        }
+
+        uintptr_t TableEntry(uintptr_t glob, uint32_t id)
+        {
+            uintptr_t t = 0, defs = 0, e = 0;
+            uint32_t n = 0;
+            if (!glob || !ReadPtr(glob, &t) || t < kMinPointer) return 0;
+            if (!Read32(t + kOff_Table_Count, &n) || id >= n) return 0;
+            if (!ReadPtr(t + kOff_Table_Defs, &defs) || defs < kMinPointer) return 0;
+            if (!ReadPtr(defs + static_cast<uintptr_t>(id) * 8, &e) || e < kMinPointer) return 0;
+            return e;
+        }
+
+        // Total quantity of `type` across the pack bucket(s) (bucket type 1) of
+        // the client holder - the storage crafting draws from.
+        int64_t PackCount(uint16_t type)
+        {
+            const uintptr_t h = CurrentHolder();
+            uintptr_t buckets = 0;
+            uint32_t  bcount  = 0;
+            if (!h || !ReadPtr(h + kOff_InvHolder_Buckets, &buckets) || buckets < kMinPointer) return -1;
+            if (!Read32(h + kOff_InvHolder_Count, &bcount) || bcount == 0 || bcount > 4096) return -1;
+            int64_t total = 0;
+            for (uint32_t b = 0; b < bcount; ++b)
+            {
+                uintptr_t bucket = 0, slots = 0;
+                uint16_t  bt = 0, scount = 0;
+                if (!ReadPtr(buckets + static_cast<uintptr_t>(b) * 8, &bucket) || bucket < kMinPointer) continue;
+                if (!Read16(bucket + kOff_InvBucket_Type, &bt) || bt != 1) continue;
+                if (!ReadPtr(bucket + kOff_InvBucket_Slots, &slots) || slots < kMinPointer) continue;
+                if (!Read16(bucket + kOff_InvBucket_Count, &scount) || scount > 8192) continue;
+                for (uint16_t i = 0; i < scount; ++i)
+                {
+                    const uintptr_t slot = slots + static_cast<uintptr_t>(i) * SlotStride();
+                    uint16_t tid = 0;
+                    int64_t  q   = 0;
+                    if (!Read16(slot + kOff_InvSlot_TypeId, &tid) || tid != type) continue;
+                    if (Read64(slot + kOff_InvSlot_Quantity, &q) && q > 0) total += q;
+                }
+            }
+            return total;
+        }
+
+        // Every type's total in the pack bucket(s), in one pass.
+        bool PackCounts(std::unordered_map<uint16_t, int64_t>& out)
+        {
+            out.clear();
+            const uintptr_t h = CurrentHolder();
+            uintptr_t buckets = 0;
+            uint32_t  bcount  = 0;
+            if (!h || !ReadPtr(h + kOff_InvHolder_Buckets, &buckets) || buckets < kMinPointer) return false;
+            if (!Read32(h + kOff_InvHolder_Count, &bcount) || bcount == 0 || bcount > 4096) return false;
+            for (uint32_t b = 0; b < bcount; ++b)
+            {
+                uintptr_t bucket = 0, slots = 0;
+                uint16_t  bt = 0, scount = 0;
+                if (!ReadPtr(buckets + static_cast<uintptr_t>(b) * 8, &bucket) || bucket < kMinPointer) continue;
+                if (!Read16(bucket + kOff_InvBucket_Type, &bt) || bt != 1) continue;
+                if (!ReadPtr(bucket + kOff_InvBucket_Slots, &slots) || slots < kMinPointer) continue;
+                if (!Read16(bucket + kOff_InvBucket_Count, &scount) || scount > 8192) continue;
+                for (uint16_t i = 0; i < scount; ++i)
+                {
+                    const uintptr_t slot = slots + static_cast<uintptr_t>(i) * SlotStride();
+                    uint16_t tid = 0;
+                    int64_t  q   = 0;
+                    if (!Read16(slot + kOff_InvSlot_TypeId, &tid) || tid == 0 || tid == kInvSlot_EmptyType) continue;
+                    if (Read64(slot + kOff_InvSlot_Quantity, &q) && q > 0) out[tid] += q;
+                }
+            }
+            return true;
+        }
+
+        // First material the pack is short of for `recipe`: its type and the
+        // missing amount. For a group slot any single member that already
+        // covers the amount satisfies it; otherwise the group's first member
+        // (the one the station shows) is topped up.
+        bool FirstShortfall(uint16_t recipe, uint16_t skip, uint16_t* outType, int64_t* outQty)
+        {
+            const uintptr_t r = TableEntry(g_recipeTableGlob, recipe);
+            if (!r) return false;
+
+            uintptr_t list = 0;
+            uint32_t  n    = 0;
+            if (ReadPtr(r + kOff_Recipe_Items, &list) && list >= kMinPointer &&
+                Read32(r + kOff_Recipe_Items + 8, &n) && n <= 16)
+            {
+                for (uint32_t i = 0; i < n; ++i)
+                {
+                    const uintptr_t e = list + static_cast<uintptr_t>(i) * 0x20;
+                    uint16_t type = 0;
+                    int64_t  need = 0;
+                    if (!Read16(e, &type) || type == 0xFFFF || type == skip || !Read64(e + 8, &need)) continue;
+                    if (need < 1 || need > 9999) continue;
+                    const int64_t have = PackCount(type);
+                    if (have < 0) return false;
+                    if (have < need) { *outType = type; *outQty = need - have; return true; }
+                }
+            }
+
+            list = 0; n = 0;
+            if (ReadPtr(r + kOff_Recipe_Groups, &list) && list >= kMinPointer &&
+                Read32(r + kOff_Recipe_Groups + 8, &n) && n <= 16)
+            {
+                for (uint32_t i = 0; i < n; ++i)
+                {
+                    const uintptr_t e = list + static_cast<uintptr_t>(i) * 0x18;
+                    uint16_t grp = 0;
+                    int64_t  need = 0;
+                    if (!Read16(e, &grp) || grp == 0xFFFF || !Read64(e + 8, &need)) continue;
+                    if (need < 1 || need > 9999) continue;
+                    const uintptr_t g = TableEntry(g_groupTableGlob, grp);
+                    uintptr_t memb = 0;
+                    uint32_t  mn  = 0;
+                    if (!g || !ReadPtr(g + kOff_Group_Members, &memb) || memb < kMinPointer ||
+                        !Read32(g + kOff_Group_Members + 8, &mn) || mn == 0 || mn > 512)
+                        continue;
+                    bool covered = false;
+                    uint16_t first = 0xFFFF;
+                    int64_t  firstHave = 0;
+                    for (uint32_t m = 0; m < mn && !covered; ++m)
+                    {
+                        uint16_t t = 0;
+                        if (!Read16(memb + m * 2, &t) || t == 0xFFFF) continue;
+                        const int64_t have = PackCount(t);
+                        if (have < 0) return false;
+                        if (first == 0xFFFF) { first = t; firstHave = have; }
+                        if (have >= need) covered = true;
+                    }
+                    if (!covered && first != 0xFFFF)
+                    {
+                        *outType = first;
+                        *outQty  = need - firstHave;
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        // Every item type the recipe can consume: its exact items plus every
+        // member of its material groups (capped - groups list a few dozen).
+        void RecipeMaterialTypes(uint16_t recipe, std::vector<uint16_t>& out)
+        {
+            out.clear();
+            const uintptr_t r = TableEntry(g_recipeTableGlob, recipe);
+            if (!r) return;
+            uintptr_t list = 0;
+            uint32_t  n    = 0;
+            if (ReadPtr(r + kOff_Recipe_Items, &list) && list >= kMinPointer &&
+                Read32(r + kOff_Recipe_Items + 8, &n) && n <= 16)
+                for (uint32_t i = 0; i < n; ++i)
+                {
+                    uint16_t t = 0;
+                    if (Read16(list + static_cast<uintptr_t>(i) * 0x20, &t) && t != 0xFFFF) out.push_back(t);
+                }
+            list = 0; n = 0;
+            if (ReadPtr(r + kOff_Recipe_Groups, &list) && list >= kMinPointer &&
+                Read32(r + kOff_Recipe_Groups + 8, &n) && n <= 16)
+                for (uint32_t i = 0; i < n; ++i)
+                {
+                    uint16_t grp = 0;
+                    if (!Read16(list + static_cast<uintptr_t>(i) * 0x18, &grp) || grp == 0xFFFF) continue;
+                    const uintptr_t g = TableEntry(g_groupTableGlob, grp);
+                    uintptr_t memb = 0;
+                    uint32_t  mn   = 0;
+                    if (!g || !ReadPtr(g + kOff_Group_Members, &memb) || memb < kMinPointer ||
+                        !Read32(g + kOff_Group_Members + 8, &mn) || mn == 0 || mn > 512)
+                        continue;
+                    for (uint32_t m = 0; m < mn && m < 256; ++m)
+                    {
+                        uint16_t t = 0;
+                        if (Read16(memb + m * 2, &t) && t != 0xFFFF &&
+                            std::find(out.begin(), out.end(), t) == out.end())
+                            out.push_back(t);
+                    }
+                }
+        }
+
+        bool AddNow(uint16_t recipe, uint16_t type, int64_t qty, const char* why)
+        {
+            if (!Inventory::AddItem(type, qty)) return false; // another add pending, or refused
+            RunPendingAdd();
+            const bool ok = Inventory::AddStatus() == Inventory::AddState::Added;
+            LOG("freecraft: recipe 0x%X %s item 0x%X x%lld - %s.", recipe, why, type,
+                static_cast<long long>(qty), ok ? "added" : "add failed");
+            return ok;
+        }
+
+        // Material counts per recipe as of its last panel query. The panel
+        // re-queries a recipe right after it is crafted, so a drop since then is
+        // what the craft consumed - it is added back (real free craft). Kept per
+        // recipe because the panel queries several recipes in a row (the
+        // selected one and its neighbours); a single "last recipe" snapshot was
+        // overwritten before the post-craft query (live: Thick Hide 36 -> 35).
+        struct CraftSnap
+        {
+            ULONGLONG at = 0;
+            std::vector<std::pair<uint16_t, int64_t>> counts;
+        };
+        std::unordered_map<uint16_t, CraftSnap> g_snaps;
+        constexpr ULONGLONG kSnapMaxAgeMs = 10 * 60 * 1000;
+
+        // Materials Free Crafting put into the pack that were not the player's
+        // ("on loan"). A craft uses loaned units first, so only the player's
+        // own units are refunded; whatever is still on loan when the player
+        // leaves the station is taken back (FreeCraftTick), so the inventory
+        // ends exactly where it started.
+        std::unordered_map<uint16_t, int64_t> g_lent;
+        ULONGLONG g_lastPanelAt = 0;
+
+        void FreeCraftNow(uint16_t recipe, uint16_t skip)
+        {
+            const ULONGLONG now = GetTickCount64();
+            g_lastPanelAt = now;
+
+            // 0. Forget stale snapshots so an old one can never refund a drop
+            //    that happened long after (selling, dropping, ...).
+            for (auto it = g_snaps.begin(); it != g_snaps.end();)
+                it = (now - it->second.at > kSnapMaxAgeMs) ? g_snaps.erase(it) : std::next(it);
+
+            std::unordered_map<uint16_t, int64_t> have;
+            const auto countOf = [&have](uint16_t t) { const auto f = have.find(t); return f == have.end() ? int64_t(0) : f->second; };
+
+            // 1. Refund what the last craft of this recipe consumed.
+            if (const auto it = g_snaps.find(recipe); it != g_snaps.end() && PackCounts(have))
+                for (const auto& [type, before] : it->second.counts)
+                {
+                    const int64_t cur = countOf(type);
+                    if (cur >= before) continue;
+                    const int64_t used = before - cur;
+                    int64_t& lent = g_lent[type];
+                    const int64_t fromLoan = used < lent ? used : lent;
+                    lent -= fromLoan;
+                    const int64_t own = used - fromLoan; // the player's own units
+                    if (own > 0 && !AddNow(recipe, type, own, "used"))
+                        break;
+                }
+
+            // 2. Top up anything still short. At most one add per material type,
+            //    so a count that somehow does not move can never loop.
+            uint16_t done[16];
+            int nd = 0;
+            while (nd < 16)
+            {
+                uint16_t type = 0;
+                int64_t  qty  = 0;
+                if (!FirstShortfall(recipe, skip, &type, &qty)) break;
+                bool seen = false;
+                for (int i = 0; i < nd; ++i) seen |= done[i] == type;
+                if (seen) break;
+                done[nd++] = type;
+                if (!AddNow(recipe, type, qty, "short of")) break;
+                g_lent[type] += qty;
+            }
+
+            // 3. Remember the counts the next craft will be measured against.
+            if (!PackCounts(have)) return;
+            std::vector<uint16_t> types;
+            RecipeMaterialTypes(recipe, types);
+            CraftSnap& snap = g_snaps[recipe];
+            snap.at = now;
+            snap.counts.clear();
+            for (const uint16_t t : types)
+            {
+                if (t == skip) continue; // the item being upgraded is never given back
+                const int64_t c = countOf(t);
+                if (c > 0) snap.counts.emplace_back(t, c);
+            }
+            // A refund of one recipe restores materials other recipes share;
+            // bring their snapshots up to date so the same drop is not
+            // refunded twice.
+            for (auto& [rid, other] : g_snaps)
+            {
+                if (rid == recipe) continue;
+                for (auto& [t, c] : other.counts)
+                {
+                    const int64_t cur = countOf(t);
+                    if (cur > c) c = cur;
+                }
+            }
+        }
+
+        bool SafeFreeCraftNow(uint16_t recipe, uint16_t skip)
+        {
+            __try { FreeCraftNow(recipe, skip); return true; }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        }
+
+        uint8_t __fastcall hkPanelCanCraft(void* a, void* b, uint32_t recipe, void* d, void* e, void* f)
+        {
+            if (State::Get().freeCraft && !Inventory::IsTransactionActive())
+                SafeFreeCraftNow(static_cast<uint16_t>(recipe), 0xFFFF);
+            return g_origCanCraft(a, b, recipe, d, e, f);
+        }
+
+        // Refinement (smithy "Equipped Gear"): the panel finds the refinement
+        // recipe for a gear item with kSig_RefineFindRecipe(ctx, item, flag) -
+        // item +8 = type, +0xA = level - which caches the recipe id at
+        // ctx+0x378 and returns true when there is one. The refine screen does
+        // not go through the crafting planner, so it gets its own hook; the
+        // gear itself (the recipe's base entry) is excluded from top-up/refund.
+        constexpr const char* kSig_RefineFindRecipe =
+            "48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 41 54 41 55 41 56 41 57 "
+            "48 83 EC 20 45 0F B6 E8 48 8B F2 48 8B E9 41 BF FF FF 00 00 66 44 39 B9 78 03 00 00";
+        constexpr uintptr_t kOff_RefineCtx_Recipe = 0x378;
+        constexpr uintptr_t kOff_RefineItem_Type  = 0x08;
+
+        using RefineFind_t = bool(__fastcall*)(uintptr_t ctx, uintptr_t item, uint8_t flag);
+        RefineFind_t oRefineFind = nullptr;
+        void* g_refineFindTarget = nullptr;
+
+        // The refine item lives on the game thread's stack, which sits far below
+        // kMinPointer - mem::Read16 rejects it, so read it under SEH directly.
+        bool ReadStackU16(uintptr_t addr, uint16_t* out)
+        {
+            if (addr < 0x10000) return false;
+            __try { *out = *reinterpret_cast<volatile uint16_t*>(addr); return true; }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        }
+
+        bool __fastcall hkRefineFind(uintptr_t ctx, uintptr_t item, uint8_t flag)
+        {
+            const bool found = oRefineFind(ctx, item, flag);
+            if (found && State::Get().freeCraft && !Inventory::IsTransactionActive())
+            {
+                uint16_t recipe = 0xFFFF, base = 0xFFFF;
+                if (Read16(ctx + kOff_RefineCtx_Recipe, &recipe) && recipe != 0xFFFF &&
+                    ReadStackU16(item + kOff_RefineItem_Type, &base))
+                    SafeFreeCraftNow(recipe, base);
+            }
+            return found;
+        }
+
+        void FreeCraftInstall()
+        {
+            void* page = Friendly::SpareCavePage();
+            if (!page) { LOG_WARN("freecraft: no cave page reserved - Free Crafting unavailable."); return; }
+
+            const uintptr_t m = mem::FindPattern(kSig_CraftPanelCanCraftCall);
+            if (!m || mem::CountMatches(kSig_CraftPanelCanCraftCall) != 1)
+            { LOG_WARN("freecraft: crafting panel call site not found/unique - Free Crafting unavailable."); return; }
+            const uintptr_t rl = mem::FindPattern(kSig_RecipeLookupCall);
+            const uintptr_t gl = mem::FindPattern(kSig_GroupLookupCall);
+            g_recipeTableGlob = rl ? LookupTableGlobal(CallTarget(rl + kOff_RecipeLookupCall)) : 0;
+            g_groupTableGlob  = gl ? LookupTableGlobal(CallTarget(gl + kOff_GroupLookupCall)) : 0;
+            if (!g_recipeTableGlob || !g_groupTableGlob)
+            { LOG_WARN("freecraft: recipe/group tables not resolved - Free Crafting unavailable."); return; }
+
+            uint8_t* site = reinterpret_cast<uint8_t*>(m + kOff_CraftPanelCall);
+            const uintptr_t canCraft = CallTarget(reinterpret_cast<uintptr_t>(site));
+
+            uint8_t* cave = static_cast<uint8_t*>(page);
+            g_origCanCraft = reinterpret_cast<CanCraft_t>(canCraft);
+            // jmp [rip] ; dq hkPanelCanCraft  (the DLL is out of rel32 reach)
+            uint8_t stub[14] = { 0xFF, 0x25, 0, 0, 0, 0 };
+            const uint64_t det = reinterpret_cast<uint64_t>(&hkPanelCanCraft);
+            std::memcpy(stub + 6, &det, 8);
+            std::memcpy(cave, stub, sizeof(stub));
+            FlushInstructionCache(GetCurrentProcess(), cave, sizeof(stub));
+
+            const int64_t rel = reinterpret_cast<intptr_t>(cave) - reinterpret_cast<intptr_t>(site + 5);
+            if (rel < INT32_MIN || rel > INT32_MAX) { LOG_WARN("freecraft: cave out of rel32 range."); return; }
+            uint8_t patch[5] = { 0xE8 };
+            const int32_t r32 = static_cast<int32_t>(rel);
+            std::memcpy(patch + 1, &r32, 4);
+            std::memcpy(g_craftCallOrig, site, 5);
+            if (!mem::PatchMemory(reinterpret_cast<uintptr_t>(site), patch, 5))
+            { LOG_WARN("freecraft: could not patch the panel call site."); return; }
+            g_craftCallSite = site;
+
+            mem::InstallHook("freecraft: refine recipe lookup", kSig_RefineFindRecipe,
+                             "Free Crafting will not cover refinement",
+                             &hkRefineFind, &oRefineFind, &g_refineFindTarget, 2);
+            LOG_OK("freecraft: panel hook @ 0x%p -> cave 0x%p (can-craft 0x%p, recipes 0x%p, groups 0x%p)",
+                   site, cave, reinterpret_cast<void*>(canCraft),
+                   reinterpret_cast<void*>(g_recipeTableGlob), reinterpret_cast<void*>(g_groupTableGlob));
+        }
+
+        void FreeCraftRemove()
+        {
+            if (g_craftCallSite)
+                mem::PatchMemory(reinterpret_cast<uintptr_t>(g_craftCallSite), g_craftCallOrig, 5);
+            g_craftCallSite = nullptr;
+            mem::RemoveHook(&g_refineFindTarget);
+            // The cave page stays: a thread may still be inside it.
+        }
+
+        // Take `qty` units of `type` back out of the pack: lower stacks (or
+        // clear them) in the client pack, the server-authority holder and every
+        // parallel pack copy (the crafting copy included), newest rows first.
+        int64_t ReclaimType(uint16_t type, int64_t qty)
+        {
+            const uintptr_t ch = CurrentHolder();
+            const uintptr_t sh = ServerHolder();
+            uintptr_t buckets = 0;
+            uint32_t  bcount  = 0;
+            if (!ch || !ReadPtr(ch + kOff_InvHolder_Buckets, &buckets) || buckets < kMinPointer) return 0;
+            if (!Read32(ch + kOff_InvHolder_Count, &bcount) || bcount == 0 || bcount > 4096) return 0;
+            const uintptr_t stride = SlotStride();
+            int64_t taken = 0;
+            for (uint32_t b = 0; b < bcount && taken < qty; ++b)
+            {
+                uintptr_t bucket = 0, slots = 0;
+                uint16_t  bt = 0, scount = 0;
+                if (!ReadPtr(buckets + static_cast<uintptr_t>(b) * 8, &bucket) || bucket < kMinPointer) continue;
+                if (!Read16(bucket + kOff_InvBucket_Type, &bt) || bt != 1) continue;
+                if (!ReadPtr(bucket + kOff_InvBucket_Slots, &slots) || slots < kMinPointer) continue;
+                if (!Read16(bucket + kOff_InvBucket_Count, &scount) || scount == 0 || scount > 8192) continue;
+                for (int i = static_cast<int>(scount) - 1; i >= 0 && taken < qty; --i)
+                {
+                    const uint16_t idx = static_cast<uint16_t>(i);
+                    const uintptr_t slot = slots + static_cast<uintptr_t>(idx) * stride;
+                    uint16_t tid = 0;
+                    int64_t  q   = 0;
+                    if (!Read16(slot + kOff_InvSlot_TypeId, &tid) || tid != type) continue;
+                    if (!Read64(slot + kOff_InvSlot_Quantity, &q) || q <= 0) continue;
+                    const int64_t take = (qty - taken) < q ? (qty - taken) : q;
+                    if (take < q)
+                    {
+                        if (!Write64(slot + kOff_InvSlot_Quantity, q - take)) continue;
+                        WriteServerMirror(b, idx, type, q, q - take);
+                    }
+                    else
+                    {
+                        // Whole stack was on loan: clear it like RemoveItem does.
+                        const uintptr_t sSlot = sh ? SlotByPos(sh, b, idx, type) : 0;
+                        std::memset(reinterpret_cast<void*>(slot), 0, stride);
+                        Write16(slot + kOff_InvSlot_TypeId, kInvSlot_EmptyType);
+                        if (sSlot >= kMinPointer)
+                        {
+                            std::memset(reinterpret_cast<void*>(sSlot), 0, stride);
+                            Write16(sSlot + kOff_InvSlot_TypeId, kInvSlot_EmptyType);
+                        }
+                    }
+                    SyncMirrorRowAt(slots, scount, idx); // crafting copy + other pack copies
+                    taken += take;
+                }
+            }
+            if (taken > 0)
+            {
+                RepairUsedSlots(ch);
+                if (sh) RepairUsedSlots(sh);
+                g_inventoryMutation.fetch_add(1, std::memory_order_release);
+            }
+            return taken;
+        }
+
+        // Runs from Inventory::Tick, which only ticks while the player moves -
+        // i.e. after leaving the station. Takes back everything still on loan.
+        void FreeCraftTick()
+        {
+            if (g_lent.empty()) return;
+            if (GetTickCount64() - g_lastPanelAt < 1500) return;
+            if (Inventory::IsTransactionActive()) return;
+            for (auto& [type, qty] : g_lent)
+            {
+                if (qty <= 0) continue;
+                const int64_t got = ReclaimType(type, qty);
+                LOG("freecraft: returned loaned item 0x%X x%lld (of %lld).", type,
+                    static_cast<long long>(got), static_cast<long long>(qty));
+            }
+            g_lent.clear();
+            g_snaps.clear();
+        }
     }
 }

@@ -45,5 +45,7 @@ namespace trinity::core
     uintptr_t GetSlotStride();
     uintptr_t GetItemValSocketOffset();
     uintptr_t GetItemDefBucketTypeOffset();
+    uintptr_t GetItemDefLayoutShift();        // +8 on TU 2.04.05+ for ItemDef fields at >= +0xF8
+    uintptr_t GetItemDefMaxEnduranceOffset();
     uintptr_t GetItemValWorkingSize();
 }

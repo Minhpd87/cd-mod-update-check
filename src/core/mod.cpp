@@ -15,6 +15,7 @@
 #include "../game/dye.h"
 #include "../game/equipment.h"
 #include "../game/friendly.h"
+#include "live.h"
 #if defined(TRINITY_EXTENDED)
 #include "../game/dlc.h"
 #endif
@@ -29,6 +30,10 @@ namespace trinity
         m_module = module;
         Logger::InitFileLogging(module);
         LOG("Trinity v%s initializing (built %s).", TRINITY_VERSION, TRINITY_BUILD_TIME);
+
+        // Grab the trust cave page before the game fills the address space
+        // around its image (see Friendly::ReserveCave).
+        game::Friendly::ReserveCave();
 
         // Detect and log game version on startup
         core::GetGameVersion();
@@ -62,6 +67,7 @@ namespace trinity
         game::Dye::Install();       // Armor dye / material / repair look
         game::Equipment::Install(); // Abyss-gear socket editor
         game::Friendly::Install();  // Trust Multiplier (gift/feed/tame)
+        live::Start(module);        // live diagnostics channel (Trinity_live.txt)
 #if defined(TRINITY_EXTENDED)
         game::DLC::Install();
 #endif

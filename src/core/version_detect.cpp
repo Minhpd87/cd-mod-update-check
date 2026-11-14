@@ -187,13 +187,45 @@ namespace trinity::core
         return 0x60;     // Modern offset in TU 1.17+
     }
 
+    // TU 2.04.05+ (seen on PE 1.0.0.3576): ItemInfo gained _soundNameOnMaxCharged
+    // at +0xE8, pushing every ItemDef field from +0xF8 onward down by 8 bytes
+    // (_itemIconList 0x108->0x110, _cooltime 0x1D8->0x1E0, _itemGroupInfoList
+    // 0x1F0->0x1F8, _respawnTimeSeconds 0x220->0x228, BucketType 0x240->0x248).
+    // Recovered from the game's own ItemInfo deserializer in both builds.
+    //
+    // Detected from the live code rather than a PE revision cut-off: the game
+    // reads BucketType with `movzx r32, word [r64+disp32]` all over the binary.
+    // PE 3460 has 255 hits at +0x240 vs 8 at +0x248; PE 3576 has 11 vs 249.
+    uintptr_t GetItemDefLayoutShift()
+    {
+        static uintptr_t s_shift = ~uintptr_t(0);
+        if (s_shift != ~uintptr_t(0)) return s_shift;
+        s_shift = 0;
+        if (GetGameVersion().revision < 3400) return s_shift;
+
+        const size_t oldHits = mem::FindAllMatches("0F B7 ?? 40 02 00 00", 512).size();
+        const size_t newHits = mem::FindAllMatches("0F B7 ?? 48 02 00 00", 512).size();
+        if (newHits > oldHits * 4 && newHits >= 32)
+            s_shift = 8;
+        LOG_INFO("version: ItemDef layout shift = +0x%llX (BucketType reads: +0x240 x%zu, +0x248 x%zu)",
+                 static_cast<unsigned long long>(s_shift), oldHits, newHits);
+        return s_shift;
+    }
+
+    uintptr_t GetItemDefMaxEnduranceOffset()
+    {
+        // _maxEndurance (u16) sits at +0x0E on TU 2.04 (PE 3460 and 3576 alike).
+        if (GetGameVersion().revision >= 3400) return 0x0E;
+        return 0x400; // pre-2.04 layout
+    }
+
     uintptr_t GetItemDefBucketTypeOffset()
     {
         const GameVersionInfo& info = GetGameVersion();
         if (info.tu == GameTU::TU_1_13 || info.tu == GameTU::TU_1_14 || info.tu == GameTU::TU_1_15 || info.tu == GameTU::TU_1_16)
             return 66; // Legacy bucket type offset 0x42 (66)
         if (info.revision >= 3400)
-            return 0x240; // TU 2.04: ItemDef re-laid out
+            return 0x240 + GetItemDefLayoutShift(); // TU 2.04: ItemDef re-laid out (+8 on 2.04.05+)
         if (info.revision >= 2625)
             return 0x428; // TU 2.00.00+: BucketType at +0x428 (confirmed from InvHolderInsert/CommitPlacement binary)
         return 0x418;  // Modern bucket type offset in TU 1.17 - 1.18.02
