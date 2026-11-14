@@ -492,6 +492,8 @@ namespace trinity::game
             0xC5, 0xFC, 0x10, 0x4F, 0x20, 0xC5, 0xFC, 0x11, 0x49, 0x20 };
         constexpr uint8_t kSiteMatchJunkHead[] = { 0xC5, 0xFC, 0x10, 0x07, 0x66, 0x01, 0x1D };
         constexpr uint8_t kSiteMatchJunkTail[] = { 0xC5, 0xFC, 0x11, 0x01 }; // at +11
+        // PE 3663: the junk became `sub ebx,[rip+X]` (2B 1D rel32, 6 bytes) - tail at +10.
+        constexpr uint8_t kSiteMatchJunkHead2[] = { 0xC5, 0xFC, 0x10, 0x07, 0x2B, 0x1D };
 
         static_assert(sizeof(kCaveOverwrite) == 0x73 && sizeof(kCaveAppend) == 0x6D && sizeof(kCaveMatch) == 0x71,
                       "cave prefix sizes (jump displacements depend on them)");
@@ -595,7 +597,17 @@ namespace trinity::game
             std::memcpy(stub + 0x0E, &frame, 4);
             std::memcpy(stub + 0x16, &dataA, 8);
             n = prefixLen;
-            if (junkRip)
+            if (junkRip && site[4] == 0x2B)
+            {
+                // PE 3663 site: C5 FC 10 07 | 2B 1D rel32   (len 10)
+                std::memcpy(stub + n, site, 4); n += 4;
+                const uint64_t abs = reinterpret_cast<uintptr_t>(site) + 10 +
+                                     static_cast<intptr_t>(*reinterpret_cast<const int32_t*>(site + 6));
+                stub[n++] = 0x49; stub[n++] = 0xBB;                         // mov r11, imm64
+                std::memcpy(stub + n, &abs, 8); n += 8;
+                stub[n++] = 0x41; stub[n++] = 0x2B; stub[n++] = 0x1B;       // sub ebx, [r11]
+            }
+            else if (junkRip)
             {
                 // site: C5 FC 10 07 | 66 01 1D rel32   (len 11)
                 std::memcpy(stub + n, site, 4); n += 4;
@@ -651,6 +663,7 @@ namespace trinity::game
                 LOG_WARN("friendly: store hook - append copy not found in setter 0x%p (new relationships stay unscaled).",
                          reinterpret_cast<void*>(fn));
             bool junk = false;
+            size_t mtLen = 8;
             uint8_t* mt = FindInFunction(fn, kSiteMatchPlain, sizeof(kSiteMatchPlain));
             if (!mt)
             {
@@ -659,9 +672,20 @@ namespace trinity::game
                 {
                     mt = h;
                     junk = true;
+                    mtLen = 11;
                 }
             }
-            if (!InstallStoreCave(StoreKind::Match, fn, ret, mt, junk ? 11 : 8, junk))
+            if (!mt)
+            {
+                uint8_t* h = FindInFunction(fn, kSiteMatchJunkHead2, sizeof(kSiteMatchJunkHead2));
+                if (h && std::memcmp(h + 10, kSiteMatchJunkTail, sizeof(kSiteMatchJunkTail)) == 0)
+                {
+                    mt = h;
+                    junk = true;
+                    mtLen = 10;
+                }
+            }
+            if (!InstallStoreCave(StoreKind::Match, fn, ret, mt, mtLen, junk))
                 LOG_WARN("friendly: store hook - id-match copy not found in setter 0x%p.", reinterpret_cast<void*>(fn));
         }
 

@@ -275,16 +275,26 @@ namespace trinity::game
             uintptr_t table = 0;
             if (!ReadPtr(tableGlobal, &table) || table < kMinPointer) return false;
             uint32_t count = 0;
-            if (!Read32(table + kOff_ItemTable_Count, &count) || row >= count) return false;
+            if (!Read32(table + core::GetTableCountOffset(), &count) || row >= count) return false;
             uintptr_t defs = 0;
-            // Try +0x58 (TU 1.17 - 1.18+ modern) first, else +0x50 (TU 1.10 - 1.16 legacy)
-            if (!ReadPtr(table + 0x58, &defs) || defs < kMinPointer)
-            {
-                if (!ReadPtr(table + 0x50, &defs) || defs < kMinPointer)
-                    return false;
-            }
             uintptr_t def = 0;
-            if (!ReadPtr(defs + static_cast<uintptr_t>(row) * 8, &def)) return false;
+            if (core::IsRowRecordTableLayout())
+            {
+                // PE 3663+: rows are 0x18-byte records, def* at +8.
+                if (!ReadPtr(table + core::GetTableRowsOffset(), &defs) || defs < kMinPointer) return false;
+                if (!ReadPtr(defs + static_cast<uintptr_t>(row) * core::GetTableRowStride() +
+                             core::GetTableRowDefOffset(), &def)) return false;
+            }
+            else
+            {
+                // Try +0x58 (TU 1.17 - 1.18+ modern) first, else +0x50 (TU 1.10 - 1.16 legacy)
+                if (!ReadPtr(table + 0x58, &defs) || defs < kMinPointer)
+                {
+                    if (!ReadPtr(table + 0x50, &defs) || defs < kMinPointer)
+                        return false;
+                }
+                if (!ReadPtr(defs + static_cast<uintptr_t>(row) * 8, &def)) return false;
+            }
             if (def < kMinPointer) return false;
             *out = def;
             return true;
@@ -2777,9 +2787,11 @@ namespace trinity::game
             uintptr_t table = 0;
             if (!ReadPtr(tableGlobal, &table) || table < kMinPointer) return false;
             uint32_t count = 0;
-            if (!Read32(table + kOff_ItemTable_Count, &count) || count == 0 || count > 500000) return false;
+            if (!Read32(table + core::GetTableCountOffset(), &count) || count == 0 || count > 500000) return false;
 
             uintptr_t defs = 0;
+            if (core::IsRowRecordTableLayout())
+                return ReadPtr(table + core::GetTableRowsOffset(), &defs) && defs >= kMinPointer;
             // Check modern +0x58 (TU 1.17 - 1.18+) or legacy +0x50 (TU 1.10 - 1.16)
             if (!ReadPtr(table + 0x58, &defs) || defs < kMinPointer)
             {
@@ -2852,8 +2864,106 @@ namespace trinity::game
             return false;
         }
 
+        // PE 3663+: every table has a tiny lookup
+        //     movzx r8d,[rcx] ; mov rcx,[rip+G] ; cmp r8d,[rcx+28h] ; ... call <loader>
+        // and the loader (the slow path) names its table with `lea r8,"<name>"`.
+        // Map every G to its name once; a table whose loader names it out of
+        // reach (the storage table "Inventory") is matched by its first rows.
+        struct TableName { uintptr_t global; uintptr_t lookup; char name[48]; };
+        std::vector<TableName> g_tableNames3663;
+        bool g_tableNamesBuilt = false;
+
+        bool ReadRowKey(uintptr_t def, char* out, size_t n)
+        {
+            uintptr_t obj = 0, text = 0;
+            return ReadPtr(def, &obj) && obj >= kMinPointer &&
+                   ReadPtr(obj, &text) && text >= kMinPointer &&
+                   ReadCString(text, out, n);
+        }
+
+        // Name of the table whose lookup's `mov rcx,[rip+G]` sits at `m`: the
+        // first call after it is the loader, whose `lea r8,"<name>"` names it.
+        void LoaderTableName(uintptr_t m, char* out, size_t n)
+        {
+            __try
+            {
+                const uint8_t* p = reinterpret_cast<const uint8_t*>(m);
+                for (int i = 11; i < 0x60; ++i)
+                {
+                    if (p[i] != 0xE8) continue;
+                    const uint8_t* fn = p + i + 5 + *reinterpret_cast<const int32_t*>(p + i + 1);
+                    for (int j = 0; j < 0x200; ++j)
+                    {
+                        if (fn[j] == 0x4C && fn[j + 1] == 0x8D && fn[j + 2] == 0x05)
+                        {
+                            const uint8_t* str = fn + j + 7 + *reinterpret_cast<const int32_t*>(fn + j + 3);
+                            ReadCString(reinterpret_cast<uintptr_t>(str), out, n);
+                            return;
+                        }
+                    }
+                    return;
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+
+        void BuildTableNames3663()
+        {
+            if (g_tableNamesBuilt) return;
+            g_tableNamesBuilt = true;
+            const auto hits = mem::FindAllMatches("48 8B 0D ?? ?? ?? ?? 44 3B 41 28", 1024);
+            for (const uintptr_t m : hits)
+            {
+                TableName tn{};
+                tn.global = mem::ResolveRipAt(m, 7);
+                // Lookup entry: `sub rsp,28h ; mov r8d,[rcx]` (u32 keys) or
+                // `sub rsp,28h ; movzx r8d,word [rcx]` (u16 keys) right before m.
+                uint8_t pre[8]{};
+                if (mem::ReadBytes(m - 8, pre, 8))
+                {
+                    if (pre[1] == 0x48 && pre[2] == 0x83 && pre[3] == 0xEC && pre[4] == 0x28) tn.lookup = m - 7;
+                    else if (pre[0] == 0x48 && pre[1] == 0x83 && pre[2] == 0xEC && pre[3] == 0x28) tn.lookup = m - 8;
+                }
+                LoaderTableName(m, tn.name, sizeof(tn.name));
+                g_tableNames3663.push_back(tn);
+            }
+            LOG_INFO("inventory: %zu data tables indexed (PE 3663+ layout).", g_tableNames3663.size());
+        }
+
+        uintptr_t FindTableGlobal3663(const char* name)
+        {
+            BuildTableNames3663();
+            for (const auto& tn : g_tableNames3663)
+                if (_stricmp(tn.name, name) == 0)
+                {
+                    LOG_OK("inventory: table '%s' resolved (3663 lookup) -> %p", name, reinterpret_cast<void*>(tn.global));
+                    return tn.global;
+                }
+            // Storage table: its rows are the storages themselves, in engine order.
+            if (_stricmp(name, "Inventory") == 0)
+            {
+                for (const auto& tn : g_tableNames3663)
+                {
+                    uintptr_t def0 = 0, def1 = 0;
+                    char k0[16]{}, k1[16]{};
+                    if (DefForRow(tn.global, 0, &def0) && DefForRow(tn.global, 1, &def1) &&
+                        ReadRowKey(def0, k0, sizeof(k0)) && ReadRowKey(def1, k1, sizeof(k1)) &&
+                        strcmp(k0, "Money") == 0 && strcmp(k1, "Character") == 0)
+                    {
+                        LOG_OK("inventory: table 'Inventory' resolved by row data (3663) -> %p",
+                               reinterpret_cast<void*>(tn.global));
+                        return tn.global;
+                    }
+                }
+            }
+            LOG_WARN("inventory: table '%s' not found among %zu indexed tables.", name, g_tableNames3663.size());
+            return 0;
+        }
+
         uintptr_t FindTableGlobal(const char* name, bool indirect = false)
         {
+            if (core::IsRowRecordTableLayout())
+                return FindTableGlobal3663(name);
             TableHunt hunt{ name, indirect, 0 };
             mem::FindPatternIf(indirect ? kSig_MovR8Rip : kSig_LeaR8Rip, &IsTableRef, &hunt);
             if (hunt.fn)
@@ -3009,13 +3119,19 @@ namespace trinity::game
             LOG("inventory: legacy money hooks skipped (TU 2.00+, offsets no longer valid).");
         }
 
+        // Only a capture helper (hkGetItemQty / NoteContainer): on TU 2.04 the
+        // holder comes from the core-global walk (CurrentHolder). PE 3663
+        // rewrote this function - missing it must not take the whole module down.
         const uintptr_t holderAddr = mem::FindPattern(kSig_InvGetHolder);
-        if (!holderAddr)
+        if (holderAddr)
+            oGetHolder = reinterpret_cast<GetHolder_t>(holderAddr);
+        else if (core::GetGameVersion().revision < 3400)
         {
             LOG_ERR("inventory: holder resolver signature NOT FOUND - inventory disabled.");
             return false;
         }
-        oGetHolder = reinterpret_cast<GetHolder_t>(holderAddr);
+        else
+            LOG_INFO("inventory: holder resolver not found - using the core-global walk only.");
 
         // --- Add-item primitives (all optional: without any one of them Add
         // Item is refused, and every other inventory feature still works).
@@ -3057,11 +3173,17 @@ namespace trinity::game
         if (core::GetGameVersion().revision >= 3400)
         {
             oFreePlacements = nullptr;
-            const auto recipe = mem::FindAllMatches(kSig_AddItemRecipe, 2);
+            auto recipe = mem::FindAllMatches(kSig_AddItemRecipe, 2);
+            uintptr_t planOff = kOff_AddItemRecipe_Plan;
+            if (recipe.empty())
+            {
+                recipe = mem::FindAllMatches(kSig_AddItemRecipe_3663, 2);
+                planOff = kOff_AddItemRecipe3663_Plan;
+            }
             if (recipe.size() == 1)
             {
                 const uintptr_t a = recipe[0];
-                oHolderInsert     = reinterpret_cast<HolderInsert_t>(mem::ResolveCall(a + kOff_AddItemRecipe_Plan));
+                oHolderInsert     = reinterpret_cast<HolderInsert_t>(mem::ResolveCall(a + planOff));
                 oCommitPlacement4 = reinterpret_cast<CommitPlacement4_t>(mem::ResolveCall(a + kOff_AddItemRecipe_Commit));
                 oFreePlacements   = reinterpret_cast<FreePlacements_t>(mem::ResolveCall(a + kOff_AddItemRecipe_Free));
                 oItemValueDtor    = reinterpret_cast<ItemValueDtor_t>(mem::ResolveCall(a + kOff_AddItemRecipe_Dtor));
@@ -3124,6 +3246,8 @@ namespace trinity::game
         // miss or, worse, land on an unrelated function, so they must never
         // be tried while the 2.02 sig resolves.
         if (!mem::InstallHook("inventory: slot-expansion setter", kSig_InvSetExpandSlots, "",
+                              &hkSetExpandSlots20202, &oSetExpandSlots20202, &g_expandTarget, 4) &&
+            !mem::InstallHook("inventory: slot-expansion setter (3663)", kSig_InvSetExpandSlots_3663, "",
                               &hkSetExpandSlots20202, &oSetExpandSlots20202, &g_expandTarget, 4))
         {
             const uintptr_t expandAddr = mem::FindPattern(kSig_InvSetExpandSlots);
@@ -3536,7 +3660,7 @@ namespace trinity::game
         uintptr_t table = 0;
         if (!ReadPtr(g_itemTableGlobal, &table)) return false;
         uint32_t count = 0;
-        if (!Read32(table + kOff_ItemTable_Count, &count) || count == 0 || count > 65536) return false;
+        if (!Read32(table + core::GetTableCountOffset(), &count) || count == 0 || count > 65536) return false;
 
         const uintptr_t stackOff = kOff_ItemDef_MaxStackCount;    // 0x18 (i64)
         const uintptr_t capOff   = kOff_ItemDef_ApplyMaxStackCap; // 0x111 (u8 bool)
@@ -3643,7 +3767,7 @@ namespace trinity::game
             uintptr_t table = 0;
             if (!ReadPtr(g_characterTableGlobal, &table)) return false;
             uint32_t count = 0;
-            if (!Read32(table + kOff_ItemTable_Count, &count) || count == 0 || count > 65536) return false;
+            if (!Read32(table + core::GetTableCountOffset(), &count) || count == 0 || count > 65536) return false;
 
             if (!g_charCooltimesCaptured || g_origCharCooltimes.size() != count)
             {
@@ -3683,7 +3807,7 @@ namespace trinity::game
             uintptr_t table = 0;
             uint32_t count = 0;
             if (!g_itemTableGlobal || !ReadPtr(g_itemTableGlobal, &table) ||
-                !Read32(table + kOff_ItemTable_Count, &count) || count == 0 || count > 65536)
+                !Read32(table + core::GetTableCountOffset(), &count) || count == 0 || count > 65536)
                 return false;
             if (s_saved.size() != count)
             {
@@ -3724,7 +3848,7 @@ namespace trinity::game
             uintptr_t table = 0;
             if (!ReadPtr(g_itemTableGlobal, &table)) return false;
             uint32_t count = 0;
-            if (!Read32(table + kOff_ItemTable_Count, &count) || count == 0 || count > 65536) return false;
+            if (!Read32(table + core::GetTableCountOffset(), &count) || count == 0 || count > 65536) return false;
 
             if (!g_cooltimesCaptured || g_origCooltimes.size() != count)
             {
@@ -3904,7 +4028,7 @@ namespace trinity::game
             uintptr_t table = 0;
             if (!ReadPtr(g_invTableGlobal, &table) || table < kMinPointer) return false;
             uint32_t count = 0;
-            if (!Read32(table + kOff_ItemTable_Count, &count) || count == 0 || count > 4096) return false;
+            if (!Read32(table + core::GetTableCountOffset(), &count) || count == 0 || count > 4096) return false;
 
             static std::vector<uint16_t> s_origTableMax;
             static std::vector<uint16_t> s_origTableDef;
@@ -4598,9 +4722,9 @@ namespace trinity::game
             uint32_t count = 0;
             char name[8]{};
             if (ReadPtr(g, &table) && table >= kMinPointer &&
-                Read32(table + kOff_ItemTable_Count, &count) && count > 0 && count <= 65536 &&
-                ReadPtr(table + kOff_ItemTable_Defs, &defs) && defs >= kMinPointer &&
-                ReadPtr(defs, &def) && def >= kMinPointer &&
+                Read32(table + core::GetTableCountOffset(), &count) && count > 0 && count <= 65536 &&
+                ReadPtr(table + core::GetTableRowsOffset(), &defs) && defs >= kMinPointer &&
+                ReadPtr(defs + core::GetTableRowDefOffset(), &def) && def >= kMinPointer &&
                 ReadPtr(def, &key) && key >= kMinPointer &&
                 ReadPtr(key, &text) && text >= kMinPointer &&
                 ReadCString(text, name, sizeof(name)) && strcmp(name, "Kliff") == 0)
@@ -5743,14 +5867,59 @@ namespace trinity::game
             MirrorSlotsFromBucket(clientPackSlots, clientCount, &bucketMirror);
             int ok = 0;
             bool mirrorDone = false;
+            uint16_t rowType = 0;
+            int64_t  rowQty  = 0;
+            memcpy(&rowType, row + kOff_InvSlot_TypeId, 2);
+            memcpy(&rowQty, row + kOff_InvSlot_Quantity, 8);
+            const bool rowHasItem = rowInst != 0xFFFFFFFFFFFFFFFF && rowInst != 0 &&
+                                    rowType != 0 && rowType != kInvSlot_EmptyType;
             for (int i = 0; i < n; ++i)
             {
                 const uintptr_t mSlot = copies[i] + static_cast<uintptr_t>(idx) * stride;
                 uint64_t before = 0;
+                uint16_t beforeType = 0;
                 Read64(mSlot + kOff_ItemVal_InstanceId, &before);
+                Read16(mSlot + kOff_InvSlot_TypeId, &beforeType);
+                const bool copyEmpty = before == 0xFFFFFFFFFFFFFFFF || before == 0 ||
+                                       beforeType == 0 || beforeType == kInvSlot_EmptyType;
+                // A row is NOT plain data: the item value owns heap vectors
+                // (sockets @+0x60 and others). A raw copy makes two holders own
+                // the same buffers - freed twice when the world reloads, which
+                // corrupted the allocator (PE 3663 crash after adding gear).
+                // So: same item -> quantity only; empty slot -> a freshly
+                // constructed, independent value; cleared row -> plain copy
+                // (no pointers in it); anything else -> leave it alone.
                 bool w = true;
-                for (size_t bi = 0; bi < sizeof(row) && w; ++bi)
-                    if (!Write8(mSlot + bi, row[bi])) w = false;
+                if (rowHasItem && !copyEmpty)
+                {
+                    if (before != rowInst || beforeType != rowType) continue;
+                    w = Write64(mSlot + kOff_InvSlot_Quantity, static_cast<uint64_t>(rowQty));
+                }
+                else if (rowHasItem && oItemValueCtor)
+                {
+                    alignas(16) uint8_t fresh[kItemVal_Size] = {};
+                    oItemValueCtor(fresh, &rowType, rowQty);
+                    // Scalar identity/state fields from the client row - never its pointers.
+                    memcpy(fresh + kOff_ItemVal_InstanceId, row + kOff_ItemVal_InstanceId, 8);
+                    memcpy(fresh + kOff_ItemVal_Subtype, row + kOff_ItemVal_Subtype, 2);
+                    memcpy(fresh + 0x30, row + 0x30, 8);
+                    memcpy(fresh + 0x40, row + 0x40, 4);   // durability cur/max
+                    memcpy(fresh + 0x8C, row + 0x8C, 4);
+                    memcpy(fresh + 0xA0, row + 0xA0, 2);
+                    for (size_t bi = 0; bi < stride && w; ++bi)
+                        if (!Write8(mSlot + bi, fresh[bi])) w = false;
+                }
+                else if (!rowHasItem)
+                {
+                    for (size_t bi = 0; bi < sizeof(row) && w; ++bi)
+                        if (!Write8(mSlot + bi, row[bi])) w = false;
+                }
+                else
+                {
+                    // No native ctor: the legacy full-row copy (pre-3576 behaviour).
+                    for (size_t bi = 0; bi < sizeof(row) && w; ++bi)
+                        if (!Write8(mSlot + bi, row[bi])) w = false;
+                }
                 if (!w) continue;
                 ++ok;
                 if (copies[i] == bucketMirror)
@@ -6379,13 +6548,13 @@ namespace trinity::game
                 return;
             }
             uint32_t count = 0;
-            if (!Read32(table + kOff_ItemTable_Count, &count) || !count || count > 65536)
+            if (!Read32(table + core::GetTableCountOffset(), &count) || !count || count > 65536)
             {
                 if (g_catalogDiagState != 3)
                 {
                     LOG_WARN("inventory: catalog wait - table=%p has invalid row count %u at +0x%llX.",
                              reinterpret_cast<void*>(table), static_cast<unsigned>(count),
-                             static_cast<unsigned long long>(kOff_ItemTable_Count));
+                             static_cast<unsigned long long>(core::GetTableCountOffset()));
                     g_catalogDiagState = 3;
                 }
                 return;
@@ -6529,7 +6698,7 @@ namespace trinity::game
             if (ReadPtr(g_itemTableGlobal, &table) && table >= kMinPointer)
             {
                 uint32_t count = 0;
-                if (Read32(table + kOff_ItemTable_Count, &count) && count > 0 && count <= 65536)
+                if (Read32(table + core::GetTableCountOffset(), &count) && count > 0 && count <= 65536)
                 {
                     char rowKey[64]{};
                     for (uint32_t row = 0; row < count; ++row)
@@ -6599,6 +6768,70 @@ namespace trinity::game
     }
 
     // 1. Direct Silver Setter (Sets exact silver balance in bag + server container)
+    namespace
+    {
+        // PE 3663 (live-verified 2026-11-14): the wallet (HUD balance, what
+        // shops spend) reads a STANDALONE money item value that no inventory
+        // bucket references - only UI wallet entries point at it - and it is
+        // copied back over the pack rows. Its layout is the item value's:
+        // inst @+0, type u16 @+8, qty @+0x10. Holder walks cannot reach it, so
+        // find it by content: every qword-aligned record with the money
+        // item's instance id at +0 and its type at +8 gets the new quantity
+        // at +0x10 (the copies may already disagree, so not keyed on qty).
+        int ScanRegionForMoney(uint8_t* base, size_t size, uint64_t inst, uint16_t tid,
+                               int64_t oldQty, int64_t newQty)
+        {
+            int hits = 0;
+            __try
+            {
+                for (size_t off = 0; off + 0x18 <= size; off += 8)
+                {
+                    uint64_t* p = reinterpret_cast<uint64_t*>(base + off);
+                    if (*p != inst) continue;
+                    if (*reinterpret_cast<uint16_t*>(base + off + 8) != tid) continue;
+                    int64_t* q = reinterpret_cast<int64_t*>(base + off + 0x10);
+                    // Instance id + type identify the money item; the copies can
+                    // already disagree (wallet vs. coin stack), so the quantity
+                    // only has to look like a balance.
+                    (void)oldQty;
+                    if (*q < 0 || *q > 999999999999LL || *q == newQty) continue;
+                    *q = newQty;
+                    ++hits;
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+            return hits;
+        }
+
+        void SyncMoneyEverywhereAsync(uint64_t inst, uint16_t tid, int64_t oldQty, int64_t newQty)
+        {
+            if (!inst || inst == 0xFFFFFFFFFFFFFFFF || inst < 1000) return;
+            try
+            {
+                std::thread([inst, tid, oldQty, newQty] {
+                    const ULONGLONG t0 = GetTickCount64();
+                    int hits = 0;
+                    uintptr_t a = 0x10000;
+                    MEMORY_BASIC_INFORMATION mbi{};
+                    while (a < 0x7FFFFFFF0000ULL &&
+                           VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof(mbi)) == sizeof(mbi))
+                    {
+                        const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+                        if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE &&
+                            (mbi.Protect == PAGE_READWRITE) && mbi.RegionSize < 0x40000000)
+                            hits += ScanRegionForMoney(reinterpret_cast<uint8_t*>(base), mbi.RegionSize,
+                                                       inst, tid, oldQty, newQty);
+                        a = base + mbi.RegionSize;
+                    }
+                    LOG("inventory: money sync %lld -> %lld copper: %d record(s) updated in %llu ms.",
+                        static_cast<long long>(oldQty), static_cast<long long>(newQty), hits,
+                        static_cast<unsigned long long>(GetTickCount64() - t0));
+                }).detach();
+            }
+            catch (...) {}
+        }
+    }
+
     bool Inventory::SetDirectSilver(int64_t silverAmount)
     {
         if (silverAmount < 0) silverAmount = 0;
@@ -6610,13 +6843,18 @@ namespace trinity::game
 
         // ---- Capture original copper BEFORE any writes ----
         int64_t origCopper = 0;
+        uint64_t moneyInst = 0;
         for (size_t s = 0; s < g_storages.size(); ++s)
             for (size_t g = 0; g < g_storages[s].groups.size(); ++g)
                 for (size_t i = 0; i < g_storages[s].groups[g].items.size(); ++i)
                 {
                     const Item& it = g_storages[s].groups[g].items[i];
                     if (it.typeId == moneyTid || (moneyTid == 0 && _stricmp(it.key, "Money_Copper") == 0))
-                    { origCopper = it.qty; goto origCaptured; }
+                    {
+                        origCopper = it.qty;
+                        if (it.slot >= kMinPointer) Read64(it.slot + kOff_ItemVal_InstanceId, &moneyInst);
+                        goto origCaptured;
+                    }
                 }
         origCaptured:;
 
@@ -6629,6 +6867,12 @@ namespace trinity::game
         }
 
         bool written = false;
+
+        // The amount actually in memory right before our first write (the
+        // snapshot can already show the target) - the wallet sync needs the
+        // OLD value to find the wallet's own copy.
+        int64_t memOldCopper = -1;
+        uint64_t memInst = 0;
 
         // A. Write to existing Money_Copper slots in all holders
         auto writeHolderMoney = [&](uintptr_t holder) {
@@ -6654,6 +6898,12 @@ namespace trinity::game
                     const uintptr_t slot = slots + static_cast<uintptr_t>(i) * SlotStride();
                     uint16_t tid = 0;
                     if (!Read16(slot + kOff_InvSlot_TypeId, &tid) || tid != moneyTid) continue;
+                    if (memOldCopper < 0)
+                    {
+                        int64_t q = 0;
+                        if (Read64(slot + kOff_InvSlot_Quantity, &q) && q >= 0) memOldCopper = q;
+                        Read64(slot + kOff_ItemVal_InstanceId, &memInst);
+                    }
                     Write64(slot + kOff_InvSlot_Quantity, copperAmount);
                     hWritten = true;
                 }
@@ -6748,6 +6998,10 @@ namespace trinity::game
 
         ConsolidateMoney();
         RefreshImpl(true);
+        // The wallet's own money value is outside every holder (see
+        // SyncMoneyEverywhereAsync) - bring it and any other copy along.
+        SyncMoneyEverywhereAsync(memInst ? memInst : moneyInst, moneyTid,
+                                 memOldCopper >= 0 ? memOldCopper : origCopper, copperAmount);
         LOG("inventory: SetDirectSilver -> %lld Silver (%lld Copper) [status=%d].", silverAmount, copperAmount, written ? 1 : 0);
         return written;
     }
@@ -7778,7 +8032,7 @@ namespace trinity::game
             uintptr_t table = 0;
             if (ReadPtr(s_wantedGlobal, &table) && table >= kMinPointer)
             {
-                if (Read32(table + kOff_ItemTable_Count, &wantedCount) && wantedCount > 0 && wantedCount <= kWantedRows_Max)
+                if (Read32(table + core::GetTableCountOffset(), &wantedCount) && wantedCount > 0 && wantedCount <= kWantedRows_Max)
                 {
                     static std::vector<int64_t> s_origPrice;
                     static std::vector<char>    s_wantedCaptured;
@@ -7817,6 +8071,19 @@ namespace trinity::game
         LOG_OK("world: No Bounty %s - price zeroed on %d/%u wanted row(s).",
                enable ? "applied" : "reverted", changed, wantedCount);
         return changed > 0;
+    }
+
+    bool Inventory::FindTableLookup3663(const char* name, uintptr_t* lookup, uintptr_t* global)
+    {
+        BuildTableNames3663();
+        for (const auto& tn : g_tableNames3663)
+            if (tn.lookup && _stricmp(tn.name, name) == 0)
+            {
+                *lookup = tn.lookup;
+                *global = tn.global;
+                return true;
+            }
+        return false;
     }
 
     uintptr_t Inventory::FindTableGlobal(const char* name, bool indirect)
@@ -8063,8 +8330,6 @@ namespace trinity::game
         // Both lookups open with: mov r11,rsp ; ... ; mov edi,edx ; mov rbx,[rip+table]
         constexpr size_t kOff_Lookup_MovTable = 0x15;
 
-        constexpr uintptr_t kOff_Table_Count   = 0x08; // u32
-        constexpr uintptr_t kOff_Table_Defs    = 0x58; // def*[]
         constexpr uintptr_t kOff_Recipe_Items  = 0x40; // {u16 type, ..., i64 qty @8} stride 0x20
         constexpr uintptr_t kOff_Recipe_Groups = 0x50; // {u16 group, ..., i64 qty @8} stride 0x18
         constexpr uintptr_t kOff_Group_Members = 0x48; // u16[] + u32 count @+8
@@ -8094,13 +8359,9 @@ namespace trinity::game
 
         uintptr_t TableEntry(uintptr_t glob, uint32_t id)
         {
-            uintptr_t t = 0, defs = 0, e = 0;
-            uint32_t n = 0;
-            if (!glob || !ReadPtr(glob, &t) || t < kMinPointer) return 0;
-            if (!Read32(t + kOff_Table_Count, &n) || id >= n) return 0;
-            if (!ReadPtr(t + kOff_Table_Defs, &defs) || defs < kMinPointer) return 0;
-            if (!ReadPtr(defs + static_cast<uintptr_t>(id) * 8, &e) || e < kMinPointer) return 0;
-            return e;
+            uintptr_t def = 0;
+            if (id > 0xFFFF || !DefForRow(glob, static_cast<uint16_t>(id), &def)) return 0;
+            return def;
         }
 
         // Total quantity of `type` across the pack bucket(s) (bucket type 1) of
@@ -8435,6 +8696,9 @@ namespace trinity::game
             const uintptr_t gl = mem::FindPattern(kSig_GroupLookupCall);
             g_recipeTableGlob = rl ? LookupTableGlobal(CallTarget(rl + kOff_RecipeLookupCall)) : 0;
             g_groupTableGlob  = gl ? LookupTableGlobal(CallTarget(gl + kOff_GroupLookupCall)) : 0;
+            // PE 3663 rewrote the lookups; resolve the same tables by name.
+            if (!g_recipeTableGlob) g_recipeTableGlob = FindTableGlobal("multichangeinfo");
+            if (!g_groupTableGlob)  g_groupTableGlob  = FindTableGlobal(kStr_ItemGroupInfoTable);
             if (!g_recipeTableGlob || !g_groupTableGlob)
             { LOG_WARN("freecraft: recipe/group tables not resolved - Free Crafting unavailable."); return; }
 

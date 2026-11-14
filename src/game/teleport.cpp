@@ -36,6 +36,7 @@
 #include "../hooks/xinput_hook.h"
 #include "../core/logger.h"
 #include "../core/state.h"
+#include "../core/version_detect.h"
 
 namespace trinity::game
 {
@@ -1159,10 +1160,18 @@ namespace trinity::game
             g_areaBoxesBuilt = true; // one attempt; partial results are fine
             if (!g_lvlResolver || !g_lvlRegistryGlobal) return;
 
+            // PE 3663: the table is created lazily (null until the world map
+            // first needs it). Asking its lookup for row 0 makes the game load
+            // it - this runs on the game thread, where the game does the same.
+            // Row layout (bucket count +0x18, size +0x1C, buckets +0x28,
+            // entries +0x30) is unchanged on 3663 - live-probed 2026-11-14.
+            if (core::IsRowRecordTableLayout())
+                CallTableResolver(g_lvlResolver, 0);
+
             uintptr_t reg = 0;
             if (!ReadPtr(g_lvlRegistryGlobal, &reg) || reg < kMinPointer) return;
             uint32_t fieldCount = 0;
-            if (!Read32(reg + kOff_Registry_SceneCount, &fieldCount) ||
+            if (!Read32(reg + core::GetTableCountOffset(), &fieldCount) ||
                 fieldCount == 0 || fieldCount > 4096)
                 return;
 
@@ -1224,14 +1233,27 @@ namespace trinity::game
         {
             const AreaBox* best = nullptr;
             float bestArea = 3.4e38f;
+            // Fallback for points inside no box (borders, open wilderness - on
+            // PE 3663 those otherwise read as the generic "Crimson Desert"):
+            // the box whose edge is horizontally closest, within 3 km.
+            const AreaBox* nearest = nullptr;
+            float nearestD2 = 3000.0f * 3000.0f;
             for (const AreaBox& b : g_areaBoxes)
             {
-                if (x < b.mn[0] || x > b.mx[0] || z < b.mn[2] || z > b.mx[2]) continue;
-                if (y < b.mn[1] - 64.0f || y > b.mx[1] + 64.0f) continue;
-                const float area = (b.mx[0] - b.mn[0]) * (b.mx[2] - b.mn[2]);
-                if (area < bestArea) { bestArea = area; best = &b; }
+                const bool insideXZ = !(x < b.mn[0] || x > b.mx[0] || z < b.mn[2] || z > b.mx[2]);
+                if (insideXZ && !(y < b.mn[1] - 64.0f || y > b.mx[1] + 64.0f))
+                {
+                    const float area = (b.mx[0] - b.mn[0]) * (b.mx[2] - b.mn[2]);
+                    if (area < bestArea) { bestArea = area; best = &b; }
+                    continue;
+                }
+                if (best) continue;
+                const float dx = x < b.mn[0] ? b.mn[0] - x : (x > b.mx[0] ? x - b.mx[0] : 0.0f);
+                const float dz = z < b.mn[2] ? b.mn[2] - z : (z > b.mx[2] ? z - b.mx[2] : 0.0f);
+                const float d2 = dx * dx + dz * dz;
+                if (d2 < nearestD2) { nearestD2 = d2; nearest = &b; }
             }
-            return best;
+            return best ? best : nearest;
         }
 
         // --- Curated fast-travel menu -----------------------------------------
@@ -1472,7 +1494,7 @@ namespace trinity::game
             uintptr_t reg = Registry();
             if (!reg || !g_sceneResolver) return false;
             uint32_t sceneCount = 0;
-            if (!Read32(reg + kOff_Registry_SceneCount, &sceneCount) ||
+            if (!Read32(reg + core::GetTableCountOffset(), &sceneCount) ||
                 sceneCount == 0 || sceneCount > 100000)
                 return false;
 
@@ -1513,9 +1535,11 @@ namespace trinity::game
                     cat->name = rule->category;
                 }
 
-                const bool isModernTU = (mem::FindPattern(kSig_TravelToNode) != 0);
-                const uintptr_t nodeStride = isModernTU ? kNode_Stride : kNode_Stride_Legacy;
-                const uintptr_t posOffset  = isModernTU ? kOff_Node_Position : kOff_Node_Position_Legacy;
+                // PE 3663 (live-verified): 0xC0-byte nodes, position at +0x64, no alias string.
+                const bool pe3663 = core::IsRowRecordTableLayout();
+                const bool isModernTU = !pe3663 && (mem::FindPattern(kSig_TravelToNode) != 0);
+                const uintptr_t nodeStride = pe3663 ? 0xC0 : isModernTU ? kNode_Stride : kNode_Stride_Legacy;
+                const uintptr_t posOffset  = pe3663 ? 0x64 : isModernTU ? kOff_Node_Position : kOff_Node_Position_Legacy;
 
                 for (uint32_t i = 0; i < nc; ++i)
                 {
@@ -1532,11 +1556,18 @@ namespace trinity::game
                     {
                         if (const AreaBox* box = AreaAt(pos[0], pos[1], pos[2]))
                             raw = box->name;
+                        if (raw.empty() && pe3663)
+                        {
+                            // No area boxes on 3663 yet: the node's own level name.
+                            char label[128]{};
+                            if (ReadEngineString(node + kOff_Node_LevelName, label, sizeof(label)))
+                                raw = label;
+                        }
                     }
                     else
                     {
                         char label[128]{};
-                        if (ReadEngineString(node + kOff_Node_AliasName, label, sizeof(label)) ||
+                        if ((!pe3663 && ReadEngineString(node + kOff_Node_AliasName, label, sizeof(label))) ||
                             ReadEngineString(node + kOff_Node_LevelName, label, sizeof(label)))
                             raw = label;
                     }
@@ -2255,11 +2286,25 @@ namespace trinity::game
             LOG_ERR("teleport: fast-travel trigger signature NOT FOUND - fast-travel menu disabled.");
         }
 
-        if (!ResolveTableResolver(kStr_GimmickSceneTable, &g_sceneResolver, &g_registryGlobal))
+        if (core::IsRowRecordTableLayout())
+        {
+            // PE 3663: tables are indexed by the inventory module (row = lookup(&key)).
+            uintptr_t fn = 0;
+            if (Inventory::FindTableLookup3663(kStr_GimmickSceneTable, &fn, &g_registryGlobal))
+                g_sceneResolver = reinterpret_cast<TableResolve_t>(fn);
+            if (Inventory::FindTableLookup3663(kStr_LevelNameTable, &fn, &g_lvlRegistryGlobal))
+                g_lvlResolver = reinterpret_cast<TableResolve_t>(fn);
+            if (g_sceneResolver)
+                LOG_OK("teleport: scene registry (3663) lookup %p global %p; travel via coordinate teleport.",
+                       reinterpret_cast<void*>(g_sceneResolver), reinterpret_cast<void*>(g_registryGlobal));
+            else
+                LOG_ERR("teleport: scene-registry resolver NOT FOUND - fast-travel menu disabled.");
+        }
+        else if (!ResolveTableResolver(kStr_GimmickSceneTable, &g_sceneResolver, &g_registryGlobal))
             LOG_ERR("teleport: scene-registry resolver NOT FOUND - fast-travel menu disabled.");
 
         // Named area boxes for waypoint labels (optional - degrades gracefully).
-        if (!ResolveTableResolver(kStr_LevelNameTable, &g_lvlResolver, &g_lvlRegistryGlobal))
+        if (!g_lvlResolver && !ResolveTableResolver(kStr_LevelNameTable, &g_lvlResolver, &g_lvlRegistryGlobal))
         {
             if (!ResolveTableResolver("regioninfo", &g_lvlResolver, &g_lvlRegistryGlobal))
             {
@@ -2398,13 +2443,54 @@ namespace trinity::game
 
     bool Teleport::TravelToNode(size_t cat, size_t node)
     {
-        if (!g_travelFn || !CatalogReady() || cat >= g_categories.size()) return false;
+        if (!CatalogReady() || cat >= g_categories.size()) return false;
         const TpCategory& c = g_categories[cat];
         if (node >= c.nodes.size()) return false;
+        if (!g_travelFn)
+        {
+            // PE 3663: native fast travel runs through the open world-map UI
+            // (UIGamePlayControlRootWorldMap is its `this`), so it cannot be
+            // fired from the overlay. Use the coordinate teleport the map
+            // marker feature already drives, with its safe-landing protection.
+            const TpNode& n = c.nodes[node];
+            if (n.x == 0.0f && n.y == 0.0f && n.z == 0.0f) return false;
+            if (g_pendingMarkerTp.load(std::memory_order_acquire)) return false;
+            // Node positions are absolute world coordinates; the player lives in
+            // the floating-origin frame - same conversion TeleportToMarker does.
+            Vec3 origin{};
+            if (!(g_markerOriginAddress != 0 && mem::ReadVec3(g_markerOriginAddress, &origin.x) && FiniteCoordinate(origin)))
+                origin = { 0.0f, 0.0f, 0.0f };
+            const Vec3 destination{ n.x - origin.x, n.y - origin.y + kMarker_DestLift, n.z - origin.z };
+            if (!FiniteCoordinate(destination)) return false;
+            LOG_OK("teleport: waypoint %s -> world (%.2f, %.2f, %.2f) final (%.2f, %.2f, %.2f) [origin=(%.2f, %.2f, %.2f)]",
+                   n.label.c_str(), n.x, n.y, n.z, destination.x, destination.y, destination.z,
+                   origin.x, origin.y, origin.z);
+            g_pendingDestX.store(destination.x, std::memory_order_relaxed);
+            g_pendingDestY.store(destination.y, std::memory_order_relaxed);
+            g_pendingDestZ.store(destination.z, std::memory_order_relaxed);
+            g_pendingMarkerAttempts.store(0, std::memory_order_relaxed);
+            g_pendingFromMapMarker.store(true, std::memory_order_relaxed);
+            g_pendingMarkerNotify.store(false, std::memory_order_relaxed);
+            g_pendingMarkerTp.store(true, std::memory_order_release);
+            return true;
+        }
 
         g_pendScene.store(c.nodes[node].sceneId, std::memory_order_relaxed);
         g_pendIndex.store(c.nodes[node].index, std::memory_order_relaxed);
         g_pendValid.store(true, std::memory_order_release);
+        return true;
+    }
+
+    bool Teleport::GetPlayerWorldPosition(float* x, float* y, float* z)
+    {
+        float px = 0.0f, py = 0.0f, pz = 0.0f;
+        if (!GetLastPosition(&px, &py, &pz)) return false;
+        Vec3 origin{};
+        if (!(g_markerOriginAddress != 0 && mem::ReadVec3(g_markerOriginAddress, &origin.x) && FiniteCoordinate(origin)))
+            origin = { 0.0f, 0.0f, 0.0f };
+        *x = px + origin.x;
+        *y = py + origin.y;
+        *z = pz + origin.z;
         return true;
     }
 

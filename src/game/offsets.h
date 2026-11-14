@@ -736,6 +736,10 @@ namespace trinity::game
     inline constexpr const char* kSig_InvSetExpandSlots =
         
         "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B 41 18 41 0F B7 F1 8B 49 20 48 8B FA";
+    // PE 1.0.0.3663 (unique @ 0x14236F7D0): same 4-arg setter (writes +0x16,
+    // +0x1A, +0x14 in sequence), prologue now also spills rbp.
+    inline constexpr const char* kSig_InvSetExpandSlots_3663 =
+        "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 48 8B 41 18 41 0F B7 E9 8B 49 20 48 8B F2";
     // TU <=2.01 setter (5-arg convention). 0 hits in TU 2.02.00.
     inline constexpr const char* kSig_InvSetExpandSlots_Legacy =
         "48 89 5C 24 ?? 56 48 83 EC 20 48 8B 41 ?? 48 8B F2 8B 49";
@@ -1041,12 +1045,24 @@ namespace trinity::game
     inline constexpr uintptr_t kOff_AddItemRecipe_Commit = 96;
     inline constexpr uintptr_t kOff_AddItemRecipe_Free   = 117;
     inline constexpr uintptr_t kOff_AddItemRecipe_Dtor   = 140;
+    // PE 1.0.0.3663 (@ 0x142E3FD62): same sequence, recompiled - the entry
+    // count is stored from si (5 bytes, was r15w/6) and the loop runs on rdi.
+    // The plan call moves to +43; the 8-byte loop-align nop puts commit /
+    // free / dtor back at +96 / +117 / +140.
+    inline constexpr const char* kSig_AddItemRecipe_3663 =
+        "C6 44 24 40 01 C6 44 24 38 00 C6 44 24 30 00 48 8D 45 ?? 48 89 44 24 28 66 89 74 24 20 "
+        "4C 8D 4D ?? 4D 8B C6 48 8D 55 ?? 48 8B CF E8 ?? ?? ?? ?? 48 8B 7D ?? 8B 45 ?? 48 69 F0 E0 00 00 00 "
+        "48 03 F7 48 3B FE 74 ?? 0F 1F 84 00 00 00 00 00 44 0F B7 8F D8 00 00 00 4C 8B C7 48 8D 55 ?? 49 8B CF "
+        "E8 ?? ?? ?? ?? 48 81 C7 E0 00 00 00 48 3B FE 75 ?? 48 8D 4D ?? E8 ?? ?? ?? ?? 90 48 8D 4D ?? "
+        "E8 ?? ?? ?? ?? 90 48 8D 8D ?? ?? ?? ?? E8 ?? ?? ?? ??";
+    inline constexpr uintptr_t kOff_AddItemRecipe3663_Plan = 43;
 
     // TrItemValue ctor (TU 2.01 verified @ 0x14234F210): void f(itemVal, u16* typeId, i64 qty).
     // Self-contained - fills subtype/durability/flags/sub-lists from the item
     inline constexpr const char* kSig_TrItemValueCtor =
         
-        "48 89 5C 24 18 48 89 4C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC 70 4C 8B FA 4C 8B F1 48 C7 01 FF FF FF FF 0F B7 02 66 89 41 08";
+        // PE 3663 moved the two arg copies to r14/r12 (was r15/r14) - wildcarded.
+        "48 89 5C 24 18 48 89 4C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC 70 4C 8B ?? 4C 8B ?? 48 C7 01 FF FF FF FF 0F B7 02 66 89 41 08";
 
     // Legacy (TU 1.14 - 1.18.02) TrItemValue ctor
     // OBSOLETE in TU 2.02.00 (0 hits in final scan; kept for reference).
@@ -1965,6 +1981,12 @@ namespace trinity::game
     // TrocTrCharacterViewModeEquipDevAck.
     inline constexpr const char* kSig_EquipEffectRefresh_TU204 =
         "48 89 5C 24 20 48 89 54 24 10 55 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 ?? ?? ?? ?? "
+        "B8 ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 2B E0 4C 8B E2 4C 8B F9 48 8B 41 08 48 8D 50 08 33 FF "
+        "48 85 C0 48 0F 44 D7 41 B0 01";
+    // PE 1.0.0.3663 (@ 0x140ACAAA0): same body (mov r12,rdx ; mov r15,rcx ; the
+    // locked component walk), but rbx is now pushed instead of spilled to [rsp+20h].
+    inline constexpr const char* kSig_EquipEffectRefresh_3663 =
+        "48 89 54 24 10 55 53 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 ?? ?? ?? ?? "
         "B8 ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 2B E0 4C 8B E2 4C 8B F9 48 8B 41 08 48 8D 50 08 33 FF "
         "48 85 C0 48 0F 44 D7 41 B0 01";
     inline constexpr const char* kSig_EquipEffectRefresh_Legacy =

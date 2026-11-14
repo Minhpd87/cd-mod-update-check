@@ -2165,7 +2165,9 @@ namespace trinity::game
         const uint16_t revision = core::GetGameVersion().revision;
         if (revision >= 3400)
         {
-            const auto refresh = mem::FindAllMatches(kSig_EquipEffectRefresh_TU204, 2);
+            auto refresh = mem::FindAllMatches(kSig_EquipEffectRefresh_TU204, 2);
+            if (refresh.empty())
+                refresh = mem::FindAllMatches(kSig_EquipEffectRefresh_3663, 2);
             if (refresh.size() == 1)
             {
                 g_refresh = reinterpret_cast<EquipRefresh_t>(refresh[0]);

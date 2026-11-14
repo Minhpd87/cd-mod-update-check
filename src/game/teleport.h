@@ -65,6 +65,10 @@ namespace trinity::game
         // was resolved.
         static bool   TravelToNode(size_t cat, size_t node);
 
+        // The player's position in the same absolute world frame as catalog
+        // nodes (last tracked position + the floating world origin).
+        static bool   GetPlayerWorldPosition(float* x, float* y, float* z);
+
         // --- Map Marker Teleport --------------------------------------------
         // Status code returned by TeleportToMarker.
         enum class MarkerStatus

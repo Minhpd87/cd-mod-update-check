@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstring>
 #include "../mem/safe_memory.h"
+#include "../core/version_detect.h"
 
 namespace trinity::game
 {
@@ -23,9 +24,10 @@ namespace trinity::game
             !ReadPtr(status + 8, &back) || back != owner ||
             !Read16(status + 0x30, &row) ||
             !ReadPtr(tableGlobal, &table) || !IsValidUserPtr(table) ||
-            !Read32(table + 8, &count) || !count || count > 65536 || row >= count ||
-            !ReadPtr(table + 0x58, &defs) || !IsValidUserPtr(defs) ||
-            !ReadPtr(defs + uintptr_t{row} * 8, &def) || !IsValidUserPtr(def) ||
+            !Read32(table + core::GetTableCountOffset(), &count) || !count || count > 65536 || row >= count ||
+            !ReadPtr(table + core::GetTableRowsOffset(), &defs) || !IsValidUserPtr(defs) ||
+            !ReadPtr(defs + uintptr_t{row} * core::GetTableRowStride() + core::GetTableRowDefOffset(), &def) ||
+            !IsValidUserPtr(def) ||
             !ReadPtr(def + keyOff, &textObject) || !IsValidUserPtr(textObject) ||
             !ReadPtr(textObject, &text) || !IsValidUserPtr(text)) return -1;
 
@@ -43,9 +45,10 @@ namespace trinity::game
             !ReadPtr(status + 8, &current) || current != owner ||
             !Read16(status + 0x30, &currentRow) || currentRow != row ||
             !ReadPtr(tableGlobal, &current) || current != table ||
-            !Read32(table + 8, &currentCount) || currentCount != count ||
-            !ReadPtr(table + 0x58, &current) || current != defs ||
-            !ReadPtr(defs + uintptr_t{row} * 8, &current) || current != def ||
+            !Read32(table + core::GetTableCountOffset(), &currentCount) || currentCount != count ||
+            !ReadPtr(table + core::GetTableRowsOffset(), &current) || current != defs ||
+            !ReadPtr(defs + uintptr_t{row} * core::GetTableRowStride() + core::GetTableRowDefOffset(), &current) ||
+            current != def ||
             !ReadPtr(def + keyOff, &current) || current != textObject ||
             !ReadPtr(textObject, &current) || current != text) return -1;
         return identity;

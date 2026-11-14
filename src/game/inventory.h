@@ -322,6 +322,9 @@ namespace trinity::game
 
         // Reflection table resolution helper
         static uintptr_t FindTableGlobal(const char* name, bool indirect = false);
+        // PE 3663+: a named data table's lookup function (row = fn(&key)) and its
+        // global. False on older layouts or if the table is not indexed.
+        static bool FindTableLookup3663(const char* name, uintptr_t* lookup, uintptr_t* global);
 
         // Game-thread upkeep for the two overrides above: applies (or
         // restores) whichever changed since the last call, retrying every

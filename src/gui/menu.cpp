@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <algorithm>
+#include <cmath>
 
 #include <Windows.h>
 #include <Xinput.h>
@@ -1756,21 +1758,70 @@ namespace trinity::gui
         // One continuous list: the framework scrolls it, the breadcrumb bar
         // shows "row / total", Left/Right and PgUp/PgDn jump a screen at a
         // time, and the search row filters it live.
+        // Nearest first: the row order is an index map rebuilt about once a
+        // second from the player's world position (names alone - "Crimson
+        // Desert #12" on PE 3663 - cannot tell waypoints apart).
+        float px = 0.0f, py = 0.0f, pz = 0.0f;
+        const bool havePos = game::Teleport::GetPlayerWorldPosition(&px, &py, &pz);
+        static std::vector<size_t> s_order;
+        static size_t s_orderCat = SIZE_MAX;
+        static ULONGLONG s_orderAt = 0;
+        const ULONGLONG nowMs = GetTickCount64();
+        if (s_orderCat != s_ftCat || s_order.size() != total || nowMs - s_orderAt > 1000)
+        {
+            std::vector<std::pair<float, size_t>> keyed;
+            keyed.reserve(total);
+            for (size_t k = 0; k < total; ++k)
+            {
+                const char* l = nullptr;
+                float x = 0.0f, y = 0.0f, z = 0.0f;
+                float d2 = 3.4e38f;
+                if (havePos && game::Teleport::GetNode(s_ftCat, k, &l, &x, &y, &z))
+                    d2 = (x - px) * (x - px) + (z - pz) * (z - pz);
+                keyed.emplace_back(havePos ? d2 : static_cast<float>(k), k);
+            }
+            std::stable_sort(keyed.begin(), keyed.end(),
+                             [](const std::pair<float, size_t>& a, const std::pair<float, size_t>& b) { return a.first < b.first; });
+            s_order.clear();
+            for (const auto& kv : keyed) s_order.push_back(kv.second);
+            s_orderCat = s_ftCat;
+            s_orderAt = nowMs;
+        }
+
         RenderFilteredList(total, s_ftFilter, sizeof(s_ftFilter),
             "Search this list by name.",
             "No locations match this search.",
-            [&](size_t i)
+            [&](size_t row)
             {
+                const size_t i = row < s_order.size() ? s_order[row] : row;
                 const char* label = nullptr;
                 float nx = 0.0f, ny = 0.0f, nz = 0.0f;
                 if (!game::Teleport::GetNode(s_ftCat, i, &label, &nx, &ny, &nz)) return false;
                 if (s_ftFilter[0] && !ContainsNoCase(label, s_ftFilter)) return false;
 
-                char desc[128];
+                char shown[160];
+                if (havePos)
+                {
+                    const float dx = nx - px, dz = nz - pz;
+                    const float dist = sqrtf(dx * dx + dz * dz);
+                    // +Z north, +X east (verify in game; flip here if mirrored).
+                    static const char* kDirs[8] = { "N", "NE", "E", "SE", "S", "SW", "W", "NW" };
+                    float deg = atan2f(dx, dz) * 57.2957795f;
+                    if (deg < 0.0f) deg += 360.0f;
+                    const char* dir = kDirs[static_cast<int>((deg + 22.5f) / 45.0f) & 7];
+                    if (dist >= 1000.0f)
+                        snprintf(shown, sizeof(shown), "%s  -  %.1f km %s", label, dist / 1000.0f, dir);
+                    else
+                        snprintf(shown, sizeof(shown), "%s  -  %.0f m %s", label, dist, dir);
+                }
+                else
+                    snprintf(shown, sizeof(shown), "%s", label);
+
+                char desc[160];
                 snprintf(desc, sizeof(desc), "Fast travel to %s at %.0f, %.0f, %.0f.",
                          label, nx, ny, nz);
 
-                if (ui::Option(label, desc))
+                if (ui::Option(shown, desc))
                 {
                     if (game::Teleport::TravelToNode(s_ftCat, i))
                         ui::Toast("Warping to %s", label);

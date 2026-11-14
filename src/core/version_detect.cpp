@@ -238,4 +238,13 @@ namespace trinity::core
             return 0xC0;  // 192 bytes buffer in 1.15
         return 0x108;     // 264 bytes buffer in 1.16+
     }
+
+    // Live-verified on PE 1.0.0.3663 (2026-11-14): the per-table lookup became
+    // `mov rcx,[rip+G] ; cmp r8d,[rcx+28h] ; mov rax,[rcx+20h] ; lea rdx,[r8+r8*2] ;
+    // def = [rax+rdx*8+8]` (multichangeinfo: 20812 rows, iteminfo: 8379).
+    bool IsRowRecordTableLayout() { return GetGameVersion().revision >= 3600; }
+    uintptr_t GetTableCountOffset()  { return IsRowRecordTableLayout() ? 0x28 : 0x08; }
+    uintptr_t GetTableRowsOffset()   { return IsRowRecordTableLayout() ? 0x20 : 0x58; }
+    uintptr_t GetTableRowStride()    { return IsRowRecordTableLayout() ? 0x18 : 0x08; }
+    uintptr_t GetTableRowDefOffset() { return IsRowRecordTableLayout() ? 0x08 : 0x00; }
 }

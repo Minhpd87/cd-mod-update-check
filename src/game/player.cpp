@@ -144,17 +144,23 @@ namespace trinity::game
         inline bool PlausibleStatType(int32_t t) { return t >= 0 && t < 256; }
         inline bool IsHealthType(int32_t t)     { return t == StatType_Health; }
 
+        // 25 = wing-glide gauge (PE 3663, base 320000): drains to 0 while gliding,
+        // refills on landing - live-verified 2026-11-14 that pinning it keeps the
+        // wings up with no side effects. NOT 58: that 400000 gauge is heat/burn-like
+        // and pinning it set the player on fire.
         inline bool IsPlayerStaminaType(int32_t t)
         {
             return t == StatType_SprintSt || t == StatType_StaminaPool117 || t == StatType_Stamina ||
-                   t == 20 || t == 22 || t == 17;
+                   t == 20 || t == 22 || t == 17 || t == 25;
         }
 
+        // 25 on a mount (PE 3663, base 225000) = gallop/sprint gauge: the only
+        // mount stat that drains while sprinting - live-verified 2026-11-14.
         inline bool IsMountStaminaType(int32_t t)
         {
             return t == StatType_MountSprint || t == StatType_SprintSt ||
                    t == StatType_StaminaPool117 || t == StatType_Stamina ||
-                   t == 19 || t == 20 || t == 22 || t == 17;
+                   t == 19 || t == 20 || t == 22 || t == 17 || t == 25;
         }
 
         inline bool IsSpiritType(int32_t t)
@@ -1641,7 +1647,12 @@ namespace trinity::game
                 return matches.size() == 1 ? matches[0] : 0;
             };
             uintptr_t entry = unique(kDamageEventSignature);
-            const uintptr_t accessor = unique(kDamageDefinitionSignature);
+            uintptr_t accessor = unique(kDamageDefinitionSignature);
+            // PE 3663: same accessor (instance+0xEA id, row via +0x134), new prologue.
+            if (!accessor)
+                accessor = unique(
+                    "40 53 48 83 EC 20 48 8B D9 B8 FF FF 00 00 48 81 C1 EA 00 00 00 66 39 01 74 ?? "
+                    "E8 ?? ?? ?? ?? 8B 8B 34 01 00 00 48 03 C9 48 8B 40 20 48 8B 44 C8 08");
             const uintptr_t factory = unique(kDamageBuffVtableSignature);
             const uintptr_t caller = unique(
                 "48 8B 8D ?? 00 00 00 48 89 4C 24 38 48 8D 4C 24 70 "
@@ -1649,24 +1660,43 @@ namespace trinity::game
                 "4D 8B C6 48 8D 54 24 78 49 8B CC E8 ?? ?? ?? ??");
             if (!caller) return false;
             const uintptr_t callerTarget = mem::ResolveCall(caller + 46);
-            if (!entry && callerTarget) entry = callerTarget;
-            if (!entry || !accessor || !factory || !DamageImageContains(entry, 0xD42) ||
-                callerTarget != entry)
+            // On PE 3663 the event's prologue matches dozens of functions; the
+            // unique caller is the authority for where it lives.
+            if (callerTarget && entry != callerTarget) entry = callerTarget;
+            if (!entry || !accessor || !factory || !DamageImageContains(entry, 0xD42))
                 return false;
             const mem::ModuleRegion event{entry, 0xD42};
-            const uintptr_t definitionCall = mem::FindPattern(
+            uintptr_t definitionCall = mem::FindPattern(
                 "4D 8B F0 45 33 FF 44 89 7D 90 49 8B C8 E8 ?? ?? ?? ?? "
                 "4C 8B C0 44 38 78 08 4D 0F 45 C7 4C 89 45 A0", event);
-            const uintptr_t hpCall = mem::FindPattern(
+            if (!definitionCall) // PE 3663: mov r14,r9 ; mov rcx,r8 ; ... (call still at +13)
+                definitionCall = mem::FindPattern(
+                    "4D 8B F1 49 8B C8 45 33 FF 44 89 7D ?? E8 ?? ?? ?? ?? 4C 8B C8 44 38 78 08 4D 0F 45", event);
+            uintptr_t hpCall = mem::FindPattern(
                 "48 8D 45 28 48 89 44 24 50 C6 44 24 48 00 "
                 "0F B6 85 60 09 00 00 88 44 24 40 44 88 64 24 38 44 88 54 24 30 "
                 "C6 44 24 28 00 48 89 5C 24 20 4C 8B 85 88 09 00 00 "
                 "0F B7 92 A0 00 00 00 48 8B 49 18 E8 ?? ?? ?? ??", event);
-            const uintptr_t noDead = mem::FindPattern(
+            uintptr_t hpCallOff = 63;
+            if (!hpCall)
+            {
+                // PE 3663: arg slot from r14 (was rbx), status id at +0x78 (was +0xA0).
+                hpCall = mem::FindPattern(
+                    "48 8D 45 ?? 48 89 44 24 50 C6 44 24 48 00 "
+                    "0F B6 85 60 09 00 00 88 44 24 40 44 88 64 24 38 44 88 54 24 30 "
+                    "C6 44 24 28 00 4C 89 74 24 20 4C 8B 85 88 09 00 00 "
+                    "0F B7 52 78 48 8B 49 18 E8 ?? ?? ?? ??", event);
+                hpCallOff = 60;
+            }
+            uintptr_t noDead = mem::FindPattern(
                 "48 8B 5D A0 80 BB 18 01 00 00 00 74 3F 48 8B 4D 98 "
                 "48 3B CF 7F 36 48 89 7E 08 48 B8 CF F7 53 E3 A5 9B C4 20", event);
+            if (!noDead)
+                noDead = mem::FindPattern(
+                    "48 8B 5D A0 80 BB 18 01 00 00 00 74 3F 48 8B 4D ?? "
+                    "48 3B CF 7F 36 48 89 7E 08 48 B8 CF F7 53 E3 A5 9B C4 20", event);
             if (!definitionCall || mem::ResolveCall(definitionCall + 13) != accessor ||
-                !hpCall || mem::ResolveCall(hpCall + 63) != reinterpret_cast<uintptr_t>(g_damageHookTarget) || !noDead)
+                !hpCall || mem::ResolveCall(hpCall + hpCallOff) != reinterpret_cast<uintptr_t>(g_damageHookTarget) || !noDead)
                 return false;
             const uintptr_t vtable = mem::ResolveRipAt(factory, 7);
             uintptr_t reader = 0;
@@ -1679,11 +1709,18 @@ namespace trinity::game
             // Publish immutable metadata before enabling the detour.
             g_damageDefinition = reinterpret_cast<DamageDefinition_t>(accessor);
             g_damageBuffVtable = vtable;
-            g_damageEventHpReturn = hpCall + 68;
-            if (mem::InstallHook("player: per-hit damage context", kDamageEventSignature,
-                                 "outgoing damage left native", &hkDamageEvent,
-                                 &oDamageEvent, &g_damageEventTarget))
+            g_damageEventHpReturn = hpCall + hpCallOff + 5;
+            // Hook by address (the caller-resolved entry), not by signature.
+            void* original = nullptr;
+            if (MH_CreateHook(reinterpret_cast<void*>(entry), reinterpret_cast<void*>(&hkDamageEvent), &original) == MH_OK &&
+                MH_EnableHook(reinterpret_cast<void*>(entry)) == MH_OK)
+            {
+                oDamageEvent = reinterpret_cast<DamageEvent_t>(original);
+                g_damageEventTarget = reinterpret_cast<void*>(entry);
+                LOG_OK("player: per-hit damage context hooked @ %p (hp return %p).",
+                       reinterpret_cast<void*>(entry), reinterpret_cast<void*>(g_damageEventHpReturn));
                 return true;
+            }
             g_damageEventHpReturn = 0;
             g_damageBuffVtable = 0;
             g_damageDefinition = nullptr;
@@ -1695,6 +1732,7 @@ namespace trinity::game
             uintptr_t clientGlobal = 0;
             uintptr_t serverGlobal = 0;
             uint32_t realmOffset = 0;
+            uint32_t statusOffset = 0xA0; // health status id in the status table (PE 3663: +0x78)
             bool targetLayoutVerified = false;
         };
 
@@ -1710,10 +1748,19 @@ namespace trinity::game
                 NativeDamageContract result{};
                 const mem::ModuleRegion dispatcher{reinterpret_cast<uintptr_t>(g_damageHookTarget), 0x160};
                 if (!dispatcher.base) return result;
-                const uintptr_t route = mem::FindPattern(
+                uintptr_t route = mem::FindPattern(
                     "65 48 8B 0C 25 58 00 00 00 48 8B 11 41 B8 ?? ?? ?? ?? "
                     "48 8B 0D ?? ?? ?? ?? 41 80 3C 10 00 48 0F 45 0D ?? ?? ?? ?? "
                     "48 8B 09 48 8B 51 08 48 8B 4A 10 66 3B 99 A0 00 00 00", dispatcher);
+                if (!route)
+                {
+                    // PE 3663: same route, status id moved to +0x78 (cmp bx,[rcx+78h]).
+                    route = mem::FindPattern(
+                        "65 48 8B 0C 25 58 00 00 00 48 8B 11 41 B8 ?? ?? ?? ?? "
+                        "48 8B 0D ?? ?? ?? ?? 41 80 3C 10 00 48 0F 45 0D ?? ?? ?? ?? "
+                        "48 8B 09 48 8B 51 08 48 8B 4A 10 66 3B 59 78", dispatcher);
+                    if (route) result.statusOffset = 0x78;
+                }
                 if (!route || !Read32(route + 14, &result.realmOffset) || result.realmOffset > 0x1000)
                     return NativeDamageContract{};
                 result.clientGlobal = mem::ResolveRipAt(route + 18, 7);
@@ -1764,7 +1811,7 @@ namespace trinity::game
                    ReadPtr(realm, &data) && data >= kMinPointer &&
                    ReadPtr(data + 8, &tables) && tables >= kMinPointer &&
                    ReadPtr(tables + 0x10, &statuses) && statuses >= kMinPointer &&
-                   Read16(statuses + 0xA0, status) && *status != 0xFFFF;
+                   Read16(statuses + contract.statusOffset, status) && *status != 0xFFFF;
         }
 
         uintptr_t ResolveEnemyHealthEntry(uintptr_t targetOwner, uint16_t healthStatus)
