@@ -9,6 +9,7 @@
 #include <cstring>
 #include <mutex>
 #include <vector>
+#include <array>
 #include <map>
 #include <unordered_map>
 #include <algorithm>
@@ -207,6 +208,60 @@ namespace trinity::game
         CRITICAL_SECTION g_capLock;
         bool             g_capLockInit = false;
 
+        // Persisted vanilla expansions (PE 3663, live-caught 2026-11-14): while
+        // Slot Size is on, the table default is raised to the target and the
+        // bucket expansion (_varyExpandSlotCount, SAVED) is held at 0 so the
+        // validator's max-def check passes. A save made in that state stores
+        // 0, so on the next load the in-memory capture read 0 and turning the
+        // feature off left 50 instead of 159 (50 + 109 bought slots). The
+        // true value is kept on disk instead; bought expansions only grow, so
+        // the highest value ever observed wins.
+        const char* SlotExpandPath()
+        {
+            static char path[MAX_PATH] = {};
+            if (!path[0])
+            {
+                HMODULE self = nullptr;
+                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCSTR>(&SlotExpandPath), &self);
+                if (GetModuleFileNameA(self, path, MAX_PATH))
+                {
+                    char* slash = strrchr(path, '\\');
+                    if (slash) strcpy_s(slash + 1, static_cast<size_t>(path + MAX_PATH - slash - 1), "Trinity_SlotExpand.ini");
+                    else strcpy_s(path, "Trinity_SlotExpand.ini");
+                }
+                else strcpy_s(path, "Trinity_SlotExpand.ini");
+            }
+            return path;
+        }
+
+        uint16_t PersistedExpand(uint16_t type)
+        {
+            char key[16];
+            sprintf_s(key, "type%u", static_cast<unsigned>(type));
+            const UINT v = GetPrivateProfileIntA("expand", key, 0, SlotExpandPath());
+            return static_cast<uint16_t>(v > 700 ? 0 : v);
+        }
+
+        // Returns max(observed, persisted) and stores it if it grew.
+        bool StorageSlotsForType(uint16_t type, uint16_t* def_, uint16_t* max_);
+        uint16_t RecordExpand(uint16_t type, uint16_t observed)
+        {
+            // Only storages with an InventoryInfo row are held at 0 while on;
+            // the others get a RAISED expansion from us, which must not be
+            // mistaken for a bought one.
+            uint16_t d = 0, m = 0;
+            if (!StorageSlotsForType(type, &d, &m)) return observed;
+            const uint16_t have = PersistedExpand(type);
+            if (observed <= have) return have;
+            if (observed > 700) return have;
+            char key[16], val[16];
+            sprintf_s(key, "type%u", static_cast<unsigned>(type));
+            sprintf_s(val, "%u", static_cast<unsigned>(observed));
+            WritePrivateProfileStringA("expand", key, val, SlotExpandPath());
+            return observed;
+        }
+
         bool FindOrigBucketCap(uintptr_t bucket, uint16_t type, uint16_t* out)
         {
             if (!g_capLockInit) return false;
@@ -231,7 +286,7 @@ namespace trinity::game
                 if (e.bucket == bucket && e.type == type) { have = true; break; }
             uint16_t orig = 0;
             if (!have && Read16(bucket + kOff_InvBucket_ExpandSlots, &orig))
-                g_origBucketCap.push_back({ bucket, type, orig });
+                g_origBucketCap.push_back({ bucket, type, RecordExpand(type, orig) });
             LeaveCriticalSection(&g_capLock);
         }
 
@@ -242,6 +297,7 @@ namespace trinity::game
         void UpsertOrigExpand(uintptr_t bucket, uint16_t type, uint16_t vanilla)
         {
             if (!g_capLockInit) return;
+            vanilla = RecordExpand(type, vanilla); // a save made with the feature on reads 0
             EnterCriticalSection(&g_capLock);
             bool have = false;
             for (auto& e : g_origBucketCap)
@@ -1433,6 +1489,8 @@ namespace trinity::game
         // --- Holder resolution ------------------------------------------------
         // A holder is trusted only if it exposes a structurally sane bucket
         // array - that check doubles as staleness detection after a reload.
+        // One bucket per storage type; the Inventory table has 24 rows.
+        constexpr uint32_t kMaxHolderBuckets = 64;
         bool HolderLooksValid(uintptr_t holder)
         {
             if (holder < kMinPointer) return false;
@@ -1440,7 +1498,21 @@ namespace trinity::game
             uint32_t  bcount  = 0;
             if (!ReadPtr(holder + kOff_InvHolder_Buckets, &buckets)) return false;
             if (!Read32(holder + kOff_InvHolder_Count, &bcount)) return false;
-            return buckets >= kMinPointer && bcount > 0 && bcount <= 4096;
+            if (buckets < kMinPointer || bcount == 0 || bcount > kMaxHolderBuckets) return false;
+            // The engine's expansion setter walks EVERY entry of this array and
+            // reads [entry+0x10] with no null check, so every entry must be a
+            // live bucket with a plausible storage type. (PE 3663 live crash:
+            // the mirror scan accepted a generic 3059-entry object array as a
+            // holder; the setter faulted on a non-pointer entry.)
+            for (uint32_t i = 0; i < bcount; ++i)
+            {
+                uintptr_t b = 0;
+                uint16_t  t = 0;
+                if (!ReadPtr(buckets + static_cast<uintptr_t>(i) * 8, &b) || b < kMinPointer) return false;
+                if (!Read16(b + kOff_InvBucket_Type, &t)) return false;
+                if (t != kInvSlot_EmptyType && t >= 0x100) return false;
+            }
+            return true;
         }
 
         // A container's CURRENT holder: [[container+0x68]+0xB8], which is
@@ -1946,11 +2018,21 @@ namespace trinity::game
             if (bucket)
                 g_mirrorBucket.store(bucket, std::memory_order_release);
 
+            // The holder does NOT point at the bucket directly: holder+0x18 is a
+            // separate array of bucket pointers. Pass 1 finds the array slots
+            // holding the bucket; pass 2 finds the holder whose +0x18 is that
+            // array's start (slot - idx*8) and whose count covers idx.
+            // (PE 3663: the one-level search never matched - the visible pack's
+            // holder, a different class from CurrentHolder's, stayed unknown.)
             uintptr_t holder = 0;
-            if (bucket)
+            constexpr int kMaxElemHits = 4;
+            uintptr_t elemHits[kMaxElemHits] = {};
+            int nElem = 0;
+            auto scanPass = [&](auto&& onQword)
             {
                 uintptr_t a3 = 0x10000000000ULL; uint64_t s3 = 0;
-                while (a3 < 0x7FF000000000ULL && s3 < budget && !holder)
+                bool stop = false;
+                while (a3 < 0x7FF000000000ULL && s3 < budget && !stop)
                 {
                     if (!VirtualQueryEx(GetCurrentProcess(), reinterpret_cast<LPCVOID>(a3), &mbi, sizeof(mbi)))
                     { a3 += 0x1000000ULL; continue; }
@@ -1961,25 +2043,45 @@ namespace trinity::game
                     {
                         if (sz3 > t_cap) { free(t_buf); t_buf = static_cast<uint8_t*>(malloc(sz3)); t_cap = t_buf ? sz3 : 0; }
                         if (!t_buf) return;
-                        if (!mem::ReadBytes(b3, t_buf, sz3)) { a3 = b3 + sz3; continue; }
-                        const uint8_t* p = t_buf;
-                        for (size_t off = 0; off + 8 <= sz3; off += 8)
+                        if (mem::ReadBytes(b3, t_buf, sz3))
                         {
-                            uint64_t v = 0;
-                            memcpy(&v, p + off, 8);
-                            if (v != bucket) continue;
-                            const uintptr_t cand = (b3 + off) - kOff_InvHolder_Buckets;
-                            if (cand < 0x10000000000ULL) continue;
-                            uint32_t bc = 0;
-                            if (!Read32(cand + kOff_InvHolder_Count, &bc) || !bc || bc > 4096) continue;
-                            holder = cand;
-                            break;
+                            for (size_t off = 0; off + 8 <= sz3 && !stop; off += 8)
+                            {
+                                uint64_t v = 0;
+                                memcpy(&v, t_buf + off, 8);
+                                stop = onQword(b3 + off, v);
+                            }
+                            s3 += sz3;
                         }
-                        s3 += sz3;
                     }
                     a3 = b3 + sz3;
                     if (!sz3) a3 += 0x1000000ULL;
                 }
+            };
+            if (bucket)
+            {
+                scanPass([&](uintptr_t at, uint64_t v) {
+                    if (v == bucket && at >= 0x10000000000ULL && nElem < kMaxElemHits) elemHits[nElem++] = at;
+                    return nElem >= kMaxElemHits;
+                });
+                if (nElem)
+                    scanPass([&](uintptr_t at, uint64_t v) {
+                        for (int e = 0; e < nElem; ++e)
+                        {
+                            if (v > elemHits[e] || elemHits[e] - v > 32 * 8 || (elemHits[e] - v) % 8) continue;
+                            const uint32_t idx = static_cast<uint32_t>((elemHits[e] - v) / 8);
+                            const uintptr_t cand = at - kOff_InvHolder_Buckets;
+                            if (cand < 0x10000000000ULL) continue;
+                            uint32_t bc = 0;
+                            uintptr_t slotBucket = 0;
+                            if (!Read32(cand + kOff_InvHolder_Count, &bc) || !bc || bc > kMaxHolderBuckets || idx >= bc) continue;
+                            if (!ReadPtr(v + static_cast<uintptr_t>(idx) * 8, &slotBucket) || slotBucket != bucket) continue;
+                            if (!HolderLooksValid(cand)) continue; // full bucket-array check, keep scanning
+                            holder = cand;
+                            return true;
+                        }
+                        return false;
+                    });
             }
             if (holder)
             {
@@ -6778,8 +6880,20 @@ namespace trinity::game
         // find it by content: every qword-aligned record with the money
         // item's instance id at +0 and its type at +8 gets the new quantity
         // at +0x10 (the copies may already disagree, so not keyed on qty).
+        int PatchI64IfEquals(uintptr_t at, int64_t expect, int64_t value)
+        {
+            __try
+            {
+                int64_t* q = reinterpret_cast<int64_t*>(at);
+                if (*q != expect) return 0;
+                *q = value;
+                return 1;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+        }
+
         int ScanRegionForMoney(uint8_t* base, size_t size, uint64_t inst, uint16_t tid,
-                               int64_t oldQty, int64_t newQty)
+                               const int64_t* oldQtys, int nOld, int64_t newQty)
         {
             int hits = 0;
             __try
@@ -6787,14 +6901,44 @@ namespace trinity::game
                 for (size_t off = 0; off + 0x18 <= size; off += 8)
                 {
                     uint64_t* p = reinterpret_cast<uint64_t*>(base + off);
+                    // HUD wallet display (live-verified 2026-11-14): the top-right
+                    // number is a bare i64 inside UI binding nodes that only apply
+                    // deltas (it kept 3047812 - donation while the pack held our
+                    // value). Those nodes carry 0x253 markers at value-0x38 /
+                    // value-0x30. Marker + exact old balance = display copy. The
+                    // HUD redraws it on the next money change.
+                    if (off >= 0x38 &&
+                        *reinterpret_cast<uint64_t*>(base + off - 0x38) == 0x0000025300000000ULL &&
+                        *reinterpret_cast<uint64_t*>(base + off - 0x30) == 0x253ULL)
+                    {
+                        const int64_t v = static_cast<int64_t>(*p);
+                        bool isOld = false;
+                        for (int k = 0; k < nOld && !isOld; ++k) isOld = (v == oldQtys[k]);
+                        if (isOld && v >= 1000 && v != newQty) // tiny balances: too ambiguous
+                        {
+                            *reinterpret_cast<int64_t*>(p) = newQty;
+                            ++hits;
+                            // The HUD's own counter is a hash-map entry with no
+                            // marker; one binding node points at it from
+                            // value-0x10 (live 2026-11-14: patching only the
+                            // nodes left the HUD counting from the old base).
+                            const uintptr_t src = *reinterpret_cast<uintptr_t*>(base + off - 0x10);
+                            if (src >= 0x10000000000ULL && src < 0x7FF000000000ULL && !(src & 7))
+                                hits += PatchI64IfEquals(src, v, newQty);
+                            continue;
+                        }
+                    }
                     if (*p != inst) continue;
                     if (*reinterpret_cast<uint16_t*>(base + off + 8) != tid) continue;
                     int64_t* q = reinterpret_cast<int64_t*>(base + off + 0x10);
-                    // Instance id + type identify the money item; the copies can
-                    // already disagree (wallet vs. coin stack), so the quantity
-                    // only has to look like a balance.
-                    (void)oldQty;
-                    if (*q < 0 || *q > 999999999999LL || *q == newQty) continue;
+                    // Instance id + type identify the money item, but the same
+                    // pair also appears in transaction/price records (live:
+                    // 100000, 1551). Only a record holding one of the balances
+                    // read from the pack copies just before our write is a
+                    // balance copy.
+                    bool isBalance = false;
+                    for (int k = 0; k < nOld && !isBalance; ++k) isBalance = (*q == oldQtys[k]);
+                    if (!isBalance || *q == newQty) continue;
                     *q = newQty;
                     ++hits;
                 }
@@ -6803,12 +6947,18 @@ namespace trinity::game
             return hits;
         }
 
-        void SyncMoneyEverywhereAsync(uint64_t inst, uint16_t tid, int64_t oldQty, int64_t newQty)
+        void SyncMoneyEverywhereAsync(uint64_t inst, uint16_t tid, const int64_t* oldIn, int nOldIn, int64_t newQty)
         {
-            if (!inst || inst == 0xFFFFFFFFFFFFFFFF || inst < 1000) return;
+            if (!inst || inst == 0xFFFFFFFFFFFFFFFF || inst < 1000 || nOldIn <= 0) return;
+            std::array<int64_t, 4> oldQtys{};
+            int nOld = 0;
+            for (int k = 0; k < nOldIn && nOld < 4; ++k)
+                if (oldIn[k] > 0 && oldIn[k] != newQty) oldQtys[nOld++] = oldIn[k];
+            if (!nOld) return;
+            const int64_t oldQty = oldQtys[0];
             try
             {
-                std::thread([inst, tid, oldQty, newQty] {
+                std::thread([inst, tid, oldQtys, nOld, oldQty, newQty] {
                     const ULONGLONG t0 = GetTickCount64();
                     int hits = 0;
                     uintptr_t a = 0x10000;
@@ -6820,7 +6970,7 @@ namespace trinity::game
                         if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE &&
                             (mbi.Protect == PAGE_READWRITE) && mbi.RegionSize < 0x40000000)
                             hits += ScanRegionForMoney(reinterpret_cast<uint8_t*>(base), mbi.RegionSize,
-                                                       inst, tid, oldQty, newQty);
+                                                       inst, tid, oldQtys.data(), nOld, newQty);
                         a = base + mbi.RegionSize;
                     }
                     LOG("inventory: money sync %lld -> %lld copper: %d record(s) updated in %llu ms.",
@@ -6873,6 +7023,8 @@ namespace trinity::game
         // OLD value to find the wallet's own copy.
         int64_t memOldCopper = -1;
         uint64_t memInst = 0;
+        int64_t oldBalances[4] = {};
+        int nOldBalances = 0;
 
         // A. Write to existing Money_Copper slots in all holders
         auto writeHolderMoney = [&](uintptr_t holder) {
@@ -6898,11 +7050,15 @@ namespace trinity::game
                     const uintptr_t slot = slots + static_cast<uintptr_t>(i) * SlotStride();
                     uint16_t tid = 0;
                     if (!Read16(slot + kOff_InvSlot_TypeId, &tid) || tid != moneyTid) continue;
-                    if (memOldCopper < 0)
                     {
                         int64_t q = 0;
-                        if (Read64(slot + kOff_InvSlot_Quantity, &q) && q >= 0) memOldCopper = q;
-                        Read64(slot + kOff_ItemVal_InstanceId, &memInst);
+                        if (Read64(slot + kOff_InvSlot_Quantity, &q) && q > 0 && q != copperAmount)
+                        {
+                            if (memOldCopper < 0) { memOldCopper = q; Read64(slot + kOff_ItemVal_InstanceId, &memInst); }
+                            bool seen = false;
+                            for (int k = 0; k < nOldBalances; ++k) seen |= oldBalances[k] == q;
+                            if (!seen && nOldBalances < 4) oldBalances[nOldBalances++] = q;
+                        }
                     }
                     Write64(slot + kOff_InvSlot_Quantity, copperAmount);
                     hWritten = true;
@@ -7000,8 +7156,8 @@ namespace trinity::game
         RefreshImpl(true);
         // The wallet's own money value is outside every holder (see
         // SyncMoneyEverywhereAsync) - bring it and any other copy along.
-        SyncMoneyEverywhereAsync(memInst ? memInst : moneyInst, moneyTid,
-                                 memOldCopper >= 0 ? memOldCopper : origCopper, copperAmount);
+        if (!nOldBalances && origCopper > 0) oldBalances[nOldBalances++] = origCopper;
+        SyncMoneyEverywhereAsync(memInst ? memInst : moneyInst, moneyTid, oldBalances, nOldBalances, copperAmount);
         LOG("inventory: SetDirectSilver -> %lld Silver (%lld Copper) [status=%d].", silverAmount, copperAmount, written ? 1 : 0);
         return written;
     }
