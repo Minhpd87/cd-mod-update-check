@@ -2529,7 +2529,7 @@ namespace trinity::gui
     }
 
     // --- Money & Currency Generator -------------------------------------------
-    static int s_directSilverInput = 20000000;
+    static int s_directSilverInput = 10000;
     static int s_pouchCountInput = 1000;
 
     static void RenderInventoryMoneyOptional()
@@ -2559,8 +2559,8 @@ namespace trinity::gui
         ReportPendingAdd();
 
         // 1. DIRECT SILVER WALLET
-        ui::IntOption(LOC("Direct Silver Amount"), &s_directSilverInput, 0, 20000000, 1000000, 20000000,
-                      LOC("Specify the amount of Silver coins to add or set directly into your wallet (max 20,000,000). Set to 0 to clear bugged coins."));
+        ui::IntOption(LOC("Direct Silver Amount"), &s_directSilverInput, 10000, 100000, 10000, 10000,
+                      LOC("Amount of Silver to add or set directly into your wallet, 10,000 to 100,000 in steps of 10,000."));
 
         if (ui::Option(LOC(">> Set Wallet to Exact Amount <<"),
                        LOC("Sets your Silver balance to the exact value specified above.")))
@@ -2585,22 +2585,22 @@ namespace trinity::gui
         }
 
         // Quick Presets
-        if (ui::Option(LOC("Set to 1,000,000 Silver (1 Million)"), LOC("Instantly sets wallet to 1,000,000 Silver.")))
+        if (ui::Option(LOC("Set to 100,000 Silver"), LOC("Instantly sets wallet to 100,000 Silver.")))
         {
-            game::Inventory::SetDirectSilver(1000000);
-            ui::Toast(LOC("Wallet set to 1,000,000 Silver!"));
+            game::Inventory::SetDirectSilver(100000);
+            ui::Toast(LOC("Wallet set to 100,000 Silver!"));
         }
 
-        if (ui::Option(LOC("Set to 10,000,000 Silver (10 Million)"), LOC("Instantly sets wallet to 10,000,000 Silver.")))
+        if (ui::Option(LOC("Set to 200,000 Silver"), LOC("Instantly sets wallet to 200,000 Silver.")))
         {
-            game::Inventory::SetDirectSilver(10000000);
-            ui::Toast(LOC("Wallet set to 10,000,000 Silver!"));
+            game::Inventory::SetDirectSilver(200000);
+            ui::Toast(LOC("Wallet set to 200,000 Silver!"));
         }
 
-        if (ui::Option(LOC("Set to 20,000,000 Silver (20 Million)"), LOC("Instantly sets wallet to 20,000,000 Silver (Safe Cap).")))
+        if (ui::Option(LOC("Set to 300,000 Silver"), LOC("Instantly sets wallet to 300,000 Silver.")))
         {
-            game::Inventory::SetDirectSilver(20000000);
-            ui::Toast(LOC("Wallet set to 20,000,000 Silver!"));
+            game::Inventory::SetDirectSilver(300000);
+            ui::Toast(LOC("Wallet set to 300,000 Silver!"));
         }
 
         // 2. FULL SILVER POUCHES (INVENTORY ITEMS)

@@ -19,6 +19,7 @@
 #include "../core/localization.h"
 #include "../core/settings.h"
 #include "../core/state.h"
+#include "../core/host_api.h"
 #include "../game/player.h"
 #include "../game/teleport.h"
 #include "../gui/framework.h"
@@ -1590,6 +1591,42 @@ namespace trinity::hooks
         return ok;
     }
 
+    // --- Loader (Trinity.asi) callbacks --------------------------------------
+    // Under the loader the swapchain wrapper and the window subclass live in
+    // Trinity.asi; these forward its events into the same paths the in-core
+    // wrapper uses, so drawing behaves identically.
+    static bool HostRender(IDXGISwapChain3* sc, bool gameFacing) { return RenderOverlay(sc, gameFacing); }
+    static void HostPostPresent(bool drew) { PostPresentDeviceCheck(drew); }
+    static bool HostPreResize() { return PreResizeCleanup(); }
+    static void HostPostResize(IDXGISwapChain3* sc) { PostResizeRebuild(sc); }
+    static void HostColorSpace(DXGI_COLOR_SPACE_TYPE cs) { OnColorSpaceChanged(cs); }
+    static void HostReleaseRefs(const char* why) { ReleaseSwapChainRefs(why); }
+    static void HostPresentQueue(ID3D12CommandQueue* q) { PublishPresentQueue(q, true); }
+    static void HostWrapped() { g_wrapperActive = true; }
+    static bool HostWndFilter(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT* r) { return input::Filter(h, m, w, l, r); }
+
+    static const host::OverlayCallbacks g_hostCallbacks = {
+        &HostRender, &HostPostPresent, &HostPreResize, &HostPostResize, &HostColorSpace,
+        &HostReleaseRefs, &HostPresentQueue, &HostWrapped, &HostWndFilter,
+    };
+
+    static void AttachToHost(const host::Api* api)
+    {
+        // Register first, then adopt what already happened (a hot reload starts
+        // long after the swapchain exists); both orders are idempotent.
+        api->setOverlay(&g_hostCallbacks);
+        if (ID3D12CommandQueue* q = api->presentQueue())
+        {
+            PublishPresentQueue(q, true);
+            q->Release();
+        }
+        DXGI_COLOR_SPACE_TYPE cs{};
+        if (api->colorSpace(&cs)) OnColorSpaceChanged(cs);
+        if (api->wrapperActive()) g_wrapperActive = true;
+        LOG("DX12: attached to Trinity.asi loader (load #%u, wrapper %s).",
+            api->loadCount, g_wrapperActive ? "active" : "not yet");
+    }
+
     bool InstallDX12Hooks()
     {
         void* presentAddr    = nullptr;
@@ -1627,7 +1664,10 @@ namespace trinity::hooks
         // draw into the writable game-facing buffer before Streamline interpolates.
         // Done AFTER the dummy swapchain above is gone so it is never wrapped.
         // Best-effort: if it fails the native present hook still draws (non-FG).
-        InstallSwapChainCreationPatch();
+        if (const host::Api* api = host::Get())
+            AttachToHost(api);
+        else
+            InstallSwapChainCreationPatch();
 
         char exePath[MAX_PATH]{};
         GetModuleFileNameA(nullptr, exePath, MAX_PATH);
@@ -1639,6 +1679,10 @@ namespace trinity::hooks
 
     void RemoveDX12Hooks()
     {
+        // Detach from the loader first: returns once no wrapper/window callback
+        // is still running inside this module.
+        if (const host::Api* api = host::Get())
+            api->setOverlay(nullptr);
         MH_DisableHook(MH_ALL_HOOKS);
         input::Shutdown();
         hooks::RemoveXInputHooks();

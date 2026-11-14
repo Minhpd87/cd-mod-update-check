@@ -96,8 +96,22 @@ target_compile_definitions(Trinity PRIVATE
     _CRT_SECURE_NO_WARNINGS
 )
 
-# .asi is just a DLL with a different extension; strip the lib prefix too.
+# The mod core is Trinity_core.dll, loaded (and hot-reloaded) by the small
+# permanent loader below. Renamed to Trinity.asi it still runs stand-alone.
 set_target_properties(Trinity PROPERTIES
+    PREFIX ""
+    SUFFIX ".dll"
+    OUTPUT_NAME "Trinity_core"
+)
+
+# --- Loader (Trinity.asi) ---------------------------------------------------
+# Owns the swapchain wrapper + window subclass for the whole session and
+# reloads Trinity_core.dll whenever that file changes.
+add_library(TrinityLoader SHARED loader/loader.cpp)
+target_include_directories(TrinityLoader PRIVATE src)
+target_link_libraries(TrinityLoader PRIVATE dxgi)
+target_compile_definitions(TrinityLoader PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+set_target_properties(TrinityLoader PROPERTIES
     PREFIX ""
     SUFFIX ".asi"
     OUTPUT_NAME "Trinity"
@@ -111,6 +125,9 @@ set_target_properties(Trinity PROPERTIES
 if(MSVC)
     target_compile_options(Trinity PRIVATE /guard:cf)
     target_link_options(Trinity PRIVATE
+        /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT /guard:cf)
+    target_compile_options(TrinityLoader PRIVATE /guard:cf)
+    target_link_options(TrinityLoader PRIVATE
         /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT /guard:cf)
 endif()
 

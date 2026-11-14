@@ -740,6 +740,14 @@ namespace trinity::game
     // +0x1A, +0x14 in sequence), prologue now also spills rbp.
     inline constexpr const char* kSig_InvSetExpandSlots_3663 =
         "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 48 8B 41 18 41 0F B7 E9 8B 49 20 48 8B F2";
+    // PE 1.0.0.3663 money HUD counter (ctrl, delta, animate, noPopup, total),
+    // unique @ 0x1410FB490: [ctrl+0xE0] = delta, [ctrl+0xD8] += delta.
+    inline constexpr const char* kSig_HudMoneyCounter_3663 =
+        "48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 18 55 41 56 41 57 48 8D 6C 24 B0 48 81 EC 50 01 00 00 "
+        "45 0F B6 F9 45 0F B6 F0 48 8B F1 48 89 91 E0 00 00 00";
+    // Its queued money-HUD call site, unique @ 0x14A45EC1D (mov byte [rbx+34h],1; call).
+    inline constexpr const char* kSig_HudMoneyCallSite_3663 =
+        "C6 43 34 01 E8 ?? ?? ?? ?? 48 8B 07 48 89 F9 FF 90 18 01 00 00";
     // TU <=2.01 setter (5-arg convention). 0 hits in TU 2.02.00.
     inline constexpr const char* kSig_InvSetExpandSlots_Legacy =
         "48 89 5C 24 ?? 56 48 83 EC 20 48 8B 41 ?? 48 8B F2 8B 49";

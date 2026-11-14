@@ -15,7 +15,9 @@ namespace trinity
         }
 
         void Initialize(HMODULE module);
-        void Shutdown();
+        // Returns true when nothing of the mod is left running (safe to unload).
+        bool Shutdown();
+        void SaveOnExit();
 
         HMODULE Module() const { return m_module; }
 

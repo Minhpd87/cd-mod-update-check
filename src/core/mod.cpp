@@ -16,6 +16,8 @@
 #include "../game/equipment.h"
 #include "../game/friendly.h"
 #include "live.h"
+#include "host_api.h"
+#include "bg_threads.h"
 #if defined(TRINITY_EXTENDED)
 #include "../game/dlc.h"
 #endif
@@ -76,16 +78,37 @@ namespace trinity
         LOG_OK("Ready - INSERT (or LB + DOWN on controller) toggles the menu in-game.");
     }
 
-    void Mod::Shutdown()
+    void Mod::SaveOnExit()
+    {
+        if (m_initialized && State::Get().autoSave)
+            Settings::Save();
+    }
+
+    bool Mod::Shutdown()
     {
         if (!m_initialized)
-            return;
+            return true;
+
+        const bool hosted = host::Get() != nullptr;
+        if (hosted) LOG("Hot reload: shutting down this core.");
 
         // Menu changes already save as they happen; this catches anything
         // mutated outside the menu since the last write. In the launcher this
         // is inert - Save() only writes for the process that owns the file.
         if (State::Get().autoSave)
             Settings::Save();
+
+        bg::BeginStop();
+        live::Stop();
+
+        if (hosted)
+        {
+            // Stop new entries into our detours first, then give calls that
+            // are already inside one time to return before trampolines and
+            // patches go away below.
+            MH_DisableHook(MH_ALL_HOOKS);
+            Sleep(300);
+        }
 
         game::Player::Remove();
         game::Teleport::Remove();
@@ -98,9 +121,14 @@ namespace trinity
         game::DLC::Remove();
 #endif
         hooks::RemoveDX12Hooks();
+
+        const bool threadsDone = bg::WaitAll(20000);
+        if (!threadsDone) LOG_ERR("Hot reload: background work still running - old core stays mapped.");
         MH_Uninitialize();
+        if (hosted) LOG("Hot reload: core stopped%s.", threadsDone ? "" : " (unclean)");
         Logger::Shutdown();
         m_initialized = false;
+        return threadsDone;
     }
 }
 

@@ -6,6 +6,7 @@
 #include "core/mod.h"
 #include "core/state.h"
 #include "core/version.h"
+#include "core/host_api.h"
 
 #pragma comment(lib, "dbghelp.lib")
 
@@ -337,13 +338,50 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+static const trinity::host::Api* g_hostApi = nullptr;
+static PVOID g_crashVeh = nullptr;
+
+namespace trinity::host
+{
+    const Api* Get() { return g_hostApi; }
+    void Set(const Api* api) { g_hostApi = api; }
+}
+
 static DWORD WINAPI MainThread(LPVOID)
 {
     trinity::Mod::Get().Initialize(g_module);
     return 0;
 }
 
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
+// True when the permanent loader (Trinity.asi exporting TrinityHostApi) is
+// present and we are NOT that module: the loader then drives start/stop.
+static bool LoaderPresent(HMODULE self)
+{
+    HMODULE loader = GetModuleHandleA("Trinity.asi");
+    return loader && loader != self && GetProcAddress(loader, "TrinityHostApi") != nullptr;
+}
+
+// Called by the loader on its own thread (never under the loader lock).
+extern "C" __declspec(dllexport) bool TrinityCoreStart(const trinity::host::Api* api)
+{
+    if (!api || api->version != trinity::host::kApiVersion || api->size < sizeof(trinity::host::Api))
+        return false;
+    trinity::host::Set(api);
+    if (!g_crashVeh) g_crashVeh = AddVectoredExceptionHandler(0, VectoredCrashLogger);
+    trinity::Mod::Get().Initialize(g_module);
+    return true;
+}
+
+// Returns true when everything the core installed is gone and no Trinity
+// thread is left, i.e. the loader may FreeLibrary us.
+extern "C" __declspec(dllexport) bool TrinityCoreStop()
+{
+    const bool clean = trinity::Mod::Get().Shutdown();
+    if (g_crashVeh) { RemoveVectoredExceptionHandler(g_crashVeh); g_crashVeh = nullptr; }
+    return clean;
+}
+
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 {
     switch (reason)
     {
@@ -380,13 +418,24 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             }
         }
 
-        AddVectoredExceptionHandler(0, VectoredCrashLogger); // last-chance
+        // Hosted by the loader: it calls TrinityCoreStart once we are mapped.
+        if (LoaderPresent(module))
+            break;
+
+        g_crashVeh = AddVectoredExceptionHandler(0, VectoredCrashLogger); // last-chance
         SetUnhandledExceptionFilter(CrashHandler);
         // Do real work off the loader lock.
         CreateThread(nullptr, 0, MainThread, nullptr, 0, nullptr);
         break;
 
     case DLL_PROCESS_DETACH:
+        if (g_hostApi)
+        {
+            // Hot reload already ran TrinityCoreStop. At process exit other
+            // threads are gone mid-call: only persist settings, tear nothing down.
+            if (reserved) trinity::Mod::Get().SaveOnExit();
+            break;
+        }
         trinity::Mod::Get().Shutdown();
         break;
     }

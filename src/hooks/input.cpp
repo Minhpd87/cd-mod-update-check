@@ -2,6 +2,7 @@
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 #include "../core/state.h"
+#include "../core/host_api.h"
 
 // Declared in imgui_impl_win32.h.
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
@@ -46,9 +47,10 @@ namespace trinity::input
         }
     }
 
-    static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+    // Menu input handling. Returns true (with *result) when the message is
+    // consumed and must not reach the game; false passes it on.
+    static bool FilterImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, LRESULT* result)
     {
-        __try
         {
             // NOTE: the INSERT / LB+D-Pad Down toggle is polled from the render loop (see
             // hkPresent -> ui::PollMenuToggle), not handled here. Relying on the
@@ -73,7 +75,7 @@ namespace trinity::input
                         // fall through so a menu key held across open/close never
                         // sticks - the classic "walks forward forever" bug.
                         if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
-                            return TRUE;
+                        { *result = TRUE; return true; }
                     }
                     break; // non-menu keys fall through to the game untouched
 
@@ -84,11 +86,11 @@ namespace trinity::input
                     if (typing)
                     {
                         ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam);
-                        return TRUE;
+                        *result = TRUE; return true;
                     }
                     if (wParam == '\r' || wParam == '\b' || wParam == '\t' ||
                         wParam == 'q' || wParam == 'e' || wParam == 'Q' || wParam == 'E')
-                        return TRUE;
+                    { *result = TRUE; return true; }
                     break;
 
                 // Mouse is deliberately neither forwarded to ImGui nor blocked, so
@@ -98,18 +100,41 @@ namespace trinity::input
                 }
             }
 
-            if (g_originalWndProc)
-                return CallWindowProc(g_originalWndProc, hwnd, msg, wParam, lParam);
-            return DefWindowProcW(hwnd, msg, wParam, lParam);
+        }
+        return false;
+    }
+
+    bool Filter(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, LRESULT* result)
+    {
+        __try
+        {
+            return FilterImpl(hwnd, msg, wParam, lParam, result);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            return DefWindowProcW(hwnd, msg, wParam, lParam);
+            return false;
         }
+    }
+
+    static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+    {
+        LRESULT r = 0;
+        if (Filter(hwnd, msg, wParam, lParam, &r))
+            return r;
+        if (g_originalWndProc)
+            return CallWindowProc(g_originalWndProc, hwnd, msg, wParam, lParam);
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
 
     void Init(HWND hwnd)
     {
+        // Under the loader the window is subclassed by Trinity.asi, which
+        // forwards messages to Filter() (see the dx12_hook host callbacks).
+        if (const host::Api* api = host::Get())
+        {
+            api->subclassWindow(hwnd);
+            return;
+        }
         if (g_originalWndProc)
             return;
 

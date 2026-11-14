@@ -409,9 +409,12 @@ namespace trinity::live
             }
         }
 
+        volatile bool g_stop = false;
+        HANDLE g_worker = nullptr;
+
         DWORD WINAPI Worker(LPVOID)
         {
-            for (;;)
+            while (!g_stop)
             {
                 Sleep(250);
                 if (g_hitCount > g_hitsPrinted && g_hitsPrinted < 32)
@@ -456,6 +459,7 @@ namespace trinity::live
                     fclose(w);
                 }
             }
+            return 0;
         }
     }
 
@@ -470,10 +474,24 @@ namespace trinity::live
         snprintf(g_outPath, sizeof(g_outPath), "%s\\Trinity_live_out.txt", dir);
         DeleteFileA(g_inPath);
 
+        g_stop = false;
         if (HANDLE h = CreateThread(nullptr, 0, &Worker, nullptr, 0, nullptr))
         {
-            CloseHandle(h);
+            g_worker = h;
             LOG_INFO("live: diagnostics channel on - commands in Trinity_live.txt, results in Trinity_live_out.txt.");
         }
+    }
+
+    void Stop()
+    {
+        g_stop = true;
+        if (g_worker)
+        {
+            WaitForSingleObject(g_worker, 5000);
+            CloseHandle(g_worker);
+            g_worker = nullptr;
+        }
+        if (g_watchAddr) { g_watchAddr = 0; ArmAllThreads(0); }
+        if (g_veh) { RemoveVectoredExceptionHandler(g_veh); g_veh = nullptr; }
     }
 }

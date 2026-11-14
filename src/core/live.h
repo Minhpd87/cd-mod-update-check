@@ -22,4 +22,5 @@
 namespace trinity::live
 {
     void Start(HMODULE self);
+    void Stop(); // joins the worker, disarms watchpoints, removes the VEH
 }

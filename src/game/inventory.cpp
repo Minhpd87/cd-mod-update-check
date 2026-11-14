@@ -32,6 +32,7 @@
 #include "../core/text.h"
 #include "../core/state.h"
 #include "../core/version_detect.h"
+#include "../core/bg_threads.h"
 
 namespace trinity::game
 {
@@ -209,13 +210,13 @@ namespace trinity::game
         bool             g_capLockInit = false;
 
         // Persisted vanilla expansions (PE 3663, live-caught 2026-11-14): while
-        // Slot Size is on, the table default is raised to the target and the
-        // bucket expansion (_varyExpandSlotCount, SAVED) is held at 0 so the
-        // validator's max-def check passes. A save made in that state stores
-        // 0, so on the next load the in-memory capture read 0 and turning the
-        // feature off left 50 instead of 159 (50 + 109 bought slots). The
-        // true value is kept on disk instead; bought expansions only grow, so
-        // the highest value ever observed wins.
+        // Slot Size is on, the bucket expansion (_varyExpandSlotCount, SAVED)
+        // holds OUR raised value (target - default), so a save made in that
+        // state no longer carries the bought expansion, and turning the
+        // feature off after a reload would leave 50 instead of 159 (50 + 109
+        // bought slots). The true value is kept on disk instead; bought
+        // expansions only grow, so the highest value ever observed within the
+        // vanilla limit (max - default) wins.
         const char* SlotExpandPath()
         {
             static char path[MAX_PATH] = {};
@@ -243,18 +244,30 @@ namespace trinity::game
             return static_cast<uint16_t>(v > 700 ? 0 : v);
         }
 
+        // Vanilla InventoryInfo default/max per row (index = storage type),
+        // captured once before Slot Size raises the max column.
+        std::vector<uint16_t> g_origTableMax;
+        std::vector<uint16_t> g_origTableDef;
+        bool g_tableMaxCaptured = false;
+
         // Returns max(observed, persisted) and stores it if it grew.
         bool StorageSlotsForType(uint16_t type, uint16_t* def_, uint16_t* max_);
         uint16_t RecordExpand(uint16_t type, uint16_t observed)
         {
-            // Only storages with an InventoryInfo row are held at 0 while on;
-            // the others get a RAISED expansion from us, which must not be
-            // mistaken for a bought one.
+            // Slot Size raises the expansion itself (and that is saved), so
+            // only a value the vanilla table allows (max - default) can be a
+            // bought expansion; anything above it is ours and is ignored.
             uint16_t d = 0, m = 0;
             if (!StorageSlotsForType(type, &d, &m)) return observed;
+            if (g_tableMaxCaptured && type < g_origTableMax.size())
+            {
+                d = g_origTableDef[type];
+                m = g_origTableMax[type];
+            }
+            const uint16_t vanillaLimit = (m > d) ? static_cast<uint16_t>(m - d) : 0;
             const uint16_t have = PersistedExpand(type);
             if (observed <= have) return have;
-            if (observed > 700) return have;
+            if (observed > 700 || observed > vanillaLimit) return have;
             char key[16], val[16];
             sprintf_s(key, "type%u", static_cast<unsigned>(type));
             sprintf_s(val, "%u", static_cast<unsigned>(observed));
@@ -1931,7 +1944,7 @@ namespace trinity::game
             uintptr_t a = 0x10000000000ULL;
             uint64_t scanned = 0;
             const uint64_t budget = 0x180000000ULL; // 6 GB cap
-            while (a < 0x7FF000000000ULL && scanned < budget && !foundArray)
+            while (a < 0x7FF000000000ULL && scanned < budget && !foundArray && !bg::Stopping())
             {
                 if (!VirtualQueryEx(GetCurrentProcess(), reinterpret_cast<LPCVOID>(a), &mbi, sizeof(mbi)))
                 {
@@ -2231,8 +2244,7 @@ namespace trinity::game
                 {
                     s_scanForSlots = slots2;
 
-                    try { std::thread([slots2, cnt2] { ScanForMirror(slots2, cnt2); }).detach(); }
-                    catch (...) {}
+                    bg::Spawn([slots2, cnt2] { ScanForMirror(slots2, cnt2); });
                 }
             }
             // Realm-pawn path next: exact, self-validating, realm-independent.
@@ -3179,8 +3191,172 @@ namespace trinity::game
         // unchanged and provide the No Bounty feature without this hook.
     }
 
+    // --- Top-right money HUD (PE 3663, live-traced 2026-11-14) ---------------
+    // The HUD keeps its OWN running total at [ctrl+0xD8] (copper) and only
+    // adds the delta of each money event, delivered through the counter
+    // function (ctrl, delta, animate, noPopup, total) from a queued UI event
+    // on the render thread. It never re-reads the coin stack, so after Set /
+    // Add Money it lagged until a save + reload rebuilt it. We hook the
+    // counter to learn which object is the money HUD, and pull its total to
+    // the real coin stack through the game's own counter function.
+    namespace
+    {
+        using HudMoneyCounter_t = void(__fastcall*)(void* ctrl, int64_t delta,
+                                                    uint8_t animate, uint8_t noPopup,
+                                                    int64_t total);
+        HudMoneyCounter_t      oHudMoneyCounter = nullptr;
+        void*                  g_hudMoneyTarget = nullptr;
+        uintptr_t              g_hudMoneyRet    = 0; // return address of the queued money-HUD call
+        std::atomic<uintptr_t> g_hudMoneyCtrl{ 0 };
+        std::atomic<uintptr_t> g_hudMoneyVtbl{ 0 };
+        std::atomic<uintptr_t> g_hudMoneyWorld{ 0 };
+        std::atomic<DWORD>     g_hudMoneyThread{ 0 };
+        std::atomic<int64_t>   g_hudLastReal{ -1 };
+        std::atomic<int64_t>   g_hudPendingReal{ -1 };
+        std::atomic<ULONGLONG> g_hudPendingSince{ 0 };
+        constexpr uintptr_t    kOff_HudMoney_Total = 0xD8;
 
+        int64_t MoneyInHolder(uintptr_t holder, uint16_t moneyTid)
+        {
+            if (!HolderLooksValid(holder)) return -1;
+            uintptr_t buckets = 0;
+            uint32_t bcount = 0;
+            if (!ReadPtr(holder + kOff_InvHolder_Buckets, &buckets) ||
+                !Read32(holder + kOff_InvHolder_Count, &bcount)) return -1;
+            for (uint32_t b = 0; b < bcount; ++b)
+            {
+                uintptr_t bucket = 0, slots = 0;
+                uint16_t scount = 0;
+                if (!ReadPtr(buckets + static_cast<uintptr_t>(b) * 8, &bucket) || bucket < kMinPointer) continue;
+                if (!ReadPtr(bucket + kOff_InvBucket_Slots, &slots) || !Read16(bucket + kOff_InvBucket_Count, &scount)) continue;
+                if (slots < kMinPointer || scount == 0 || scount > 8192) continue;
+                for (uint16_t i = 0; i < scount; ++i)
+                {
+                    const uintptr_t slot = slots + static_cast<uintptr_t>(i) * SlotStride();
+                    uint16_t tid = 0;
+                    int64_t q = 0;
+                    if (Read16(slot + kOff_InvSlot_TypeId, &tid) && tid == moneyTid &&
+                        Read64(slot + kOff_InvSlot_Quantity, &q) && q >= 0)
+                        return q;
+                }
+            }
+            return -1;
+        }
 
+        int64_t RealCopper()
+        {
+            static uint16_t s_tid = 0;
+            if (!s_tid) s_tid = Inventory::FindTypeIdByKey("Money_Copper");
+            if (!s_tid) return -1;
+            int64_t q = MoneyInHolder(CurrentHolder(), s_tid);
+            if (q < 0) q = MoneyInHolder(ServerHolder(), s_tid);
+            return q;
+        }
+
+        // The captured HUD object, or 0 if it is unknown or belongs to an
+        // earlier world (after a reload the old object is freed).
+        uintptr_t HudMoneyCtrl()
+        {
+            const uintptr_t ctrl = g_hudMoneyCtrl.load(std::memory_order_acquire);
+            if (!ctrl) return 0;
+            uintptr_t vt = 0;
+            if (g_hudMoneyWorld.load() != Player::GetControlledOwner() ||
+                !ReadPtr(ctrl, &vt) || vt != g_hudMoneyVtbl.load())
+            {
+                g_hudMoneyCtrl.store(0);
+                return 0;
+            }
+            return ctrl;
+        }
+
+        // Moves the HUD total to `real` with the game's own counter function
+        // (no popup, no animation). Render thread only.
+        void HudMoneyPullTo(uintptr_t ctrl, int64_t real)
+        {
+            int64_t total = 0;
+            if (!oHudMoneyCounter || !Read64(ctrl + kOff_HudMoney_Total, &total) || total == real) return;
+            oHudMoneyCounter(reinterpret_cast<void*>(ctrl), real - total, 0, 1, 0);
+            LOG("inventory: money HUD %lld -> %lld copper.", static_cast<long long>(total),
+                static_cast<long long>(real));
+        }
+
+        void HudMoneyAfterEvent(uintptr_t ctrl, int64_t delta)
+        {
+            const int64_t real = RealCopper();
+            if (real < 0) return;
+            if (ctrl != HudMoneyCtrl())
+            {
+                // Only the money HUD's delta matches the coin stack's own change.
+                int64_t total = 0;
+                Read64(ctrl + kOff_HudMoney_Total, &total);
+                const int64_t last = g_hudLastReal.load();
+                const int64_t pending = g_hudPendingReal.load();
+                const bool isMoney = total == real ||
+                                     (last >= 0 && delta != 0 && real - last == delta) ||
+                                     (pending >= 0 && delta != 0 && real - pending == delta);
+                if (!isMoney) return;
+                uintptr_t vt = 0;
+                if (!ReadPtr(ctrl, &vt)) return;
+                g_hudMoneyVtbl.store(vt);
+                g_hudMoneyWorld.store(Player::GetControlledOwner());
+                g_hudMoneyCtrl.store(ctrl, std::memory_order_release);
+                LOG_OK("inventory: money HUD resolved @ %p.", reinterpret_cast<void*>(ctrl));
+            }
+            g_hudMoneyThread.store(GetCurrentThreadId());
+            g_hudLastReal.store(real);
+            g_hudPendingReal.store(-1);
+            HudMoneyPullTo(ctrl, real);
+        }
+
+        void __fastcall hkHudMoneyCounter(void* ctrl, int64_t delta, uint8_t animate,
+                                          uint8_t noPopup, int64_t total)
+        {
+            const uintptr_t ret = reinterpret_cast<uintptr_t>(_ReturnAddress());
+            oHudMoneyCounter(ctrl, delta, animate, noPopup, total);
+            if (!ctrl || !g_hudMoneyRet || ret != g_hudMoneyRet) return;
+            __try { HudMoneyAfterEvent(reinterpret_cast<uintptr_t>(ctrl), delta); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+
+        // After Set / Add Money: update the HUD now when we are on its thread
+        // and know it; otherwise the next money event pulls it over.
+        void HudMoneyResync(int64_t real)
+        {
+            g_hudPendingSince.store(GetTickCount64());
+            g_hudPendingReal.store(real);
+            g_hudLastReal.store(real);
+            __try
+            {
+                const uintptr_t ctrl = HudMoneyCtrl();
+                if (ctrl && GetCurrentThreadId() == g_hudMoneyThread.load())
+                {
+                    HudMoneyPullTo(ctrl, real);
+                    g_hudPendingReal.store(-1);
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+
+        // Per-frame (Inventory::Tick, game thread): finish a pending Set / Add
+        // Money HUD update. Menu actions run on a worker thread, so they can
+        // only queue it; the HUD object belongs to this thread. Pulls to the
+        // live coin-stack total until it reaches the requested amount (the
+        // write may land a frame later) or 5 s pass.
+        void HudMoneyTick()
+        {
+            const int64_t pending = g_hudPendingReal.load();
+            if (pending < 0) return;
+            if (GetCurrentThreadId() != g_hudMoneyThread.load()) return;
+            const uintptr_t ctrl = HudMoneyCtrl();
+            if (!ctrl) return;
+            const int64_t real = RealCopper();
+            if (real < 0) return;
+            HudMoneyPullTo(ctrl, real);
+            g_hudLastReal.store(real);
+            if (real == pending || GetTickCount64() - g_hudPendingSince.load() > 5000)
+                g_hudPendingReal.store(-1);
+        }
+    }
 
     bool Inventory::Install()
     {
@@ -3220,6 +3396,18 @@ namespace trinity::game
         {
             LOG("inventory: legacy money hooks skipped (TU 2.00+, offsets no longer valid).");
         }
+
+        // Top-right money HUD counter (PE 3663). Only the queued money-HUD
+        // call site is acted on, identified by its return address.
+        if (const uintptr_t site = mem::FindPattern(kSig_HudMoneyCallSite_3663))
+        {
+            g_hudMoneyRet = site + 9; // C6 43 34 01 (4) + E8 rel32 (5)
+            mem::InstallHook("inventory: money HUD counter (3663)", kSig_HudMoneyCounter_3663,
+                             "top-right money updates only after save + reload",
+                             &hkHudMoneyCounter, &oHudMoneyCounter, &g_hudMoneyTarget, 2);
+        }
+        else
+            LOG("inventory: money HUD call site not found - top-right money updates only after save + reload.");
 
         // Only a capture helper (hkGetItemQty / NoteContainer): on TU 2.04 the
         // holder comes from the core-global walk (CurrentHolder). PE 3663
@@ -3473,6 +3661,7 @@ namespace trinity::game
 
         mem::RemoveHook(&g_insTarget);
         mem::RemoveHook(&g_commitTarget);
+        mem::RemoveHook(&g_hudMoneyTarget);
         mem::RemoveHook(&g_expandTarget); // after the restore above, which
                                           // still calls its trampoline
         mem::RemoveHook(&g_evalWantedTarget);
@@ -4132,9 +4321,9 @@ namespace trinity::game
             uint32_t count = 0;
             if (!Read32(table + core::GetTableCountOffset(), &count) || count == 0 || count > 4096) return false;
 
-            static std::vector<uint16_t> s_origTableMax;
-            static std::vector<uint16_t> s_origTableDef;
-            static bool s_tableMaxCaptured = false;
+            auto& s_origTableMax = g_origTableMax;
+            auto& s_origTableDef = g_origTableDef;
+            bool& s_tableMaxCaptured = g_tableMaxCaptured;
 
             if (!s_tableMaxCaptured || s_origTableMax.size() != count)
             {
@@ -4172,23 +4361,27 @@ namespace trinity::game
                 if (Read16(def + kOff_InvDef_MaxSlots, &curM) && curM == finalM)
                     continue;
                 if (Write16(def + kOff_InvDef_MaxSlots, finalM))
-                    any = true;
-                // The storage UI renders "used / _defaultSlotCount" (+0x10), not
-                // /_maxSlotCount. Live-confirmed on TU 2.04.02: every table max
-                // and bucket cap showed 700 while the game still displayed
-                // 156/240. Raise the default column too, so the denominator the
-                // player actually sees follows the raised cap.
-                uint16_t finalD = enable ? finalM : s_origTableDef[row];
-                uint16_t curD = 0;
-                if (Read16(def + kOff_InvDef_DefSlots, &curD) && curD != finalD &&
-                    Write16(def + kOff_InvDef_DefSlots, finalD))
                 {
                     any = true;
                     ++rowsWritten;
                 }
+                // PE 3663 (live-confirmed 2026-11-14): the inventory screen and
+                // the pickup "inventory full" check use a client copy of the
+                // bag that is built from the SAVE at load as default + saved
+                // expansion, and is not updated live. Raising the default
+                // column while holding the expansion at 0 saved 0, so after a
+                // reload the screen showed 88/50 and pickups failed. The
+                // default stays vanilla; the extra slots go into the saved
+                // expansion, and only the max is raised so the validator
+                // accepts that expansion.
+                uint16_t finalD = s_origTableDef[row];
+                uint16_t curD = 0;
+                if (Read16(def + kOff_InvDef_DefSlots, &curD) && curD != finalD &&
+                    Write16(def + kOff_InvDef_DefSlots, finalD))
+                    any = true;
             }
             if (logTable)
-                LOG("inventory: slot table: %d/%u row(s) set to def=%u (UI snapshot may read elsewhere on this TU).",
+                LOG("inventory: slot table: %d/%u row(s) changed, max=%u (default column kept vanilla).",
                     rowsWritten, static_cast<unsigned>(count),
                     static_cast<unsigned>(targetM));
             return any;
@@ -4487,9 +4680,7 @@ namespace trinity::game
                     Read16(b + kOff_InvBucket_Count, &ccount) && ccount)
                 {
                     const uint64_t gen = g_packCopiesGen.load(std::memory_order_acquire);
-                    try { std::thread([cslots, ccount, gen]
-                          { ResolvePackCopiesWorker(cslots, ccount, gen); }).detach(); }
-                    catch (...) {}
+                    bg::Spawn([cslots, ccount, gen] { ResolvePackCopiesWorker(cslots, ccount, gen); });
                 }
                 break;
             }
@@ -4584,6 +4775,7 @@ namespace trinity::game
             // Size silently stopped applying. Isolating the frames keeps the
             // other features alive and makes the broken one obvious in logs.
             __try { RunPendingAdd(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            __try { HudMoneyTick(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
             __try { InventoryTickTracker(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
             // Live-memory add watcher: pure reads, catches the game's own adds
             // (buy/loot) so our manual write can replay their bookkeeping.
@@ -5751,8 +5943,7 @@ namespace trinity::game
             const ULONGLONG now = GetTickCount64();
             if (now - g_lastMirrorRescan < 5000) return;
             g_lastMirrorRescan = now;
-            try { std::thread([clientPackSlots, clientCount] { ScanForMirror(clientPackSlots, clientCount); }).detach(); }
-            catch (...) {}
+            bg::Spawn([clientPackSlots, clientCount] { ScanForMirror(clientPackSlots, clientCount); });
         }
 
         int CachedPackCopies(uintptr_t clientPackSlots, uint16_t clientCount,
@@ -5783,9 +5974,7 @@ namespace trinity::game
             if (ok == 0 && !g_packCopiesBusy.load(std::memory_order_acquire))
             {
                 // find the client pack bucket slots for the worker
-                try { std::thread([clientPackSlots, clientCount, gen]
-                      { ResolvePackCopiesWorker(clientPackSlots, clientCount, gen); }).detach(); }
-                catch (...) {}
+                bg::Spawn([clientPackSlots, clientCount, gen] { ResolvePackCopiesWorker(clientPackSlots, clientCount, gen); });
             }
             return ok;
         }
@@ -6956,14 +7145,13 @@ namespace trinity::game
                 if (oldIn[k] > 0 && oldIn[k] != newQty) oldQtys[nOld++] = oldIn[k];
             if (!nOld) return;
             const int64_t oldQty = oldQtys[0];
-            try
             {
-                std::thread([inst, tid, oldQtys, nOld, oldQty, newQty] {
+                bg::Spawn([inst, tid, oldQtys, nOld, oldQty, newQty] {
                     const ULONGLONG t0 = GetTickCount64();
                     int hits = 0;
                     uintptr_t a = 0x10000;
                     MEMORY_BASIC_INFORMATION mbi{};
-                    while (a < 0x7FFFFFFF0000ULL &&
+                    while (a < 0x7FFFFFFF0000ULL && !bg::Stopping() &&
                            VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof(mbi)) == sizeof(mbi))
                     {
                         const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
@@ -6976,9 +7164,8 @@ namespace trinity::game
                     LOG("inventory: money sync %lld -> %lld copper: %d record(s) updated in %llu ms.",
                         static_cast<long long>(oldQty), static_cast<long long>(newQty), hits,
                         static_cast<unsigned long long>(GetTickCount64() - t0));
-                }).detach();
+                });
             }
-            catch (...) {}
         }
     }
 
@@ -7158,6 +7345,7 @@ namespace trinity::game
         // SyncMoneyEverywhereAsync) - bring it and any other copy along.
         if (!nOldBalances && origCopper > 0) oldBalances[nOldBalances++] = origCopper;
         SyncMoneyEverywhereAsync(memInst ? memInst : moneyInst, moneyTid, oldBalances, nOldBalances, copperAmount);
+        HudMoneyResync(copperAmount);
         LOG("inventory: SetDirectSilver -> %lld Silver (%lld Copper) [status=%d].", silverAmount, copperAmount, written ? 1 : 0);
         return written;
     }
