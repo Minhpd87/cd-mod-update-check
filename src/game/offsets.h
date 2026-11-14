@@ -1855,9 +1855,10 @@ namespace trinity::game
     // material again.
     //     void f(void* comp, void* entry, uint16_t slotTag,
     //            uint8_t channel, uint8_t stackZero /*=0*/)
+    // PE 1.0.0.3663: 0x140ACC680 (no r9b home spill; channel -> r13b,
+    // entry -> rsi, comp -> r15). Unique in the 3663 exe.
     inline constexpr const char* kSig_DyeVisualClear =
-        
-        "48 89 5C 24 18 44 88 4C 24 20 55 56 57 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC 70 45 0F B7 F0 48 8B FA 48 8B F1";
+        "48 89 5C 24 18 55 56 57 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC 70 45 0F B6 E9 45 0F B7 F0 48 8B F2 4C 8B F9";
     // OBSOLETE in TU 2.02.00 (0 hits in final scan; kept for reference).
     inline constexpr const char* kSig_DyeVisualClear_Legacy =
         "48 89 5C 24 18 44 88 4C 24 20 55 56 57 41 54 41 55 41 56 41 57 "
