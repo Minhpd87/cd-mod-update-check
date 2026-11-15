@@ -8873,6 +8873,10 @@ namespace trinity::game
                 }
         }
 
+        // Count of successful "short of" top-ups (lets UI hooks tell whether a
+        // selection just made a recipe affordable).
+        uint32_t g_freeCraftTopUps = 0;
+
         bool AddNow(uint16_t recipe, uint16_t type, int64_t qty, const char* why)
         {
             if (!Inventory::AddItem(type, qty)) return false; // another add pending, or refused
@@ -8947,6 +8951,7 @@ namespace trinity::game
                 if (seen) break;
                 done[nd++] = type;
                 if (!AddNow(recipe, type, qty, "short of")) break;
+                ++g_freeCraftTopUps;
                 g_lent[type] += qty;
             }
 
@@ -9028,6 +9033,50 @@ namespace trinity::game
             return found;
         }
 
+        // Kuku Pot upgrade tree (UIGamePlayControlRoot_KukuEnchant, e.g. Kuku
+        // Cooler): it never calls the crafting-panel can-craft check, so the
+        // panel hook misses it. Selecting a node first runs f(ui, node) (PE
+        // 3663: 0x141262AF0), which reads the recipe key at node+0xDA and only
+        // then evaluates craftability (the '+' badge / Make button) and builds
+        // the material list. Topping up here, before the original runs, makes
+        // the node craftable in the same click (live-traced: keys 0x2AB3 Kuku
+        // Pot, 0x302 Kuku Cooler). Topping up later (at the material list,
+        // 0x141255AC0) left Make greyed until the tree was reopened.
+        constexpr const char* kSig_KukuNodeSelect =
+            "48 89 5C 24 18 55 56 57 41 56 41 57 48 83 EC 50 4C 8B F2 48 8B F1 45 33 C0 "
+            "48 89 91 A8 02 00 00 48 8B 91 D0 01 00 00";
+        constexpr uintptr_t kOff_KukuNode_Recipe = 0xDA;
+        constexpr uintptr_t kOff_KukuNode_CantMake = 0xDC; // u8, 1 = Make greyed
+        using KukuNodeSelect_t = uintptr_t(__fastcall*)(uintptr_t ui, uintptr_t node);
+        KukuNodeSelect_t oKukuNodeSelect = nullptr;
+        void* g_kukuNodeSelectTarget = nullptr;
+
+        uintptr_t __fastcall hkKukuNodeSelect(uintptr_t ui, uintptr_t node)
+        {
+            uint16_t recipe = 0xFFFF;
+            if (node && State::Get().freeCraft && !Inventory::IsTransactionActive() &&
+                ReadStackU16(node + kOff_KukuNode_Recipe, &recipe) && recipe != 0xFFFF)
+            {
+                const uint32_t before = g_freeCraftTopUps;
+                SafeFreeCraftNow(recipe, 0xFFFF);
+                // The node's 'cannot make' byte (+0xDC, written by the node
+                // init 0x140EAC870 when the tree opens) is only re-read here,
+                // never recomputed, so Make stayed greyed until a reopen.
+                // Clear it only when this click actually topped materials up -
+                // nodes locked for other reasons are left alone.
+                if (g_freeCraftTopUps != before)
+                {
+                    __try
+                    {
+                        volatile uint8_t* cant = reinterpret_cast<volatile uint8_t*>(node + kOff_KukuNode_CantMake);
+                        if (*cant) { *cant = 0; LOG("freecraft: kuku node recipe 0x%X made craftable after top-up.", recipe); }
+                    }
+                    __except (EXCEPTION_EXECUTE_HANDLER) {}
+                }
+            }
+            return oKukuNodeSelect(ui, node);
+        }
+
         void FreeCraftInstall()
         {
             void* page = Friendly::SpareCavePage();
@@ -9071,6 +9120,9 @@ namespace trinity::game
             mem::InstallHook("freecraft: refine recipe lookup", kSig_RefineFindRecipe,
                              "Free Crafting will not cover refinement",
                              &hkRefineFind, &oRefineFind, &g_refineFindTarget, 2);
+            mem::InstallHook("freecraft: kuku tree node select", kSig_KukuNodeSelect,
+                             "Free Crafting will not cover the Kuku Pot upgrade tree",
+                             &hkKukuNodeSelect, &oKukuNodeSelect, &g_kukuNodeSelectTarget, 2);
             LOG_OK("freecraft: panel hook @ 0x%p -> cave 0x%p (can-craft 0x%p, recipes 0x%p, groups 0x%p)",
                    site, cave, reinterpret_cast<void*>(canCraft),
                    reinterpret_cast<void*>(g_recipeTableGlob), reinterpret_cast<void*>(g_groupTableGlob));
@@ -9082,6 +9134,7 @@ namespace trinity::game
                 mem::PatchMemory(reinterpret_cast<uintptr_t>(g_craftCallSite), g_craftCallOrig, 5);
             g_craftCallSite = nullptr;
             mem::RemoveHook(&g_refineFindTarget);
+            mem::RemoveHook(&g_kukuNodeSelectTarget);
             // The cave page stays: a thread may still be inside it.
         }
 
