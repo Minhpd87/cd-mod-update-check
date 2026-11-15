@@ -138,6 +138,8 @@ namespace trinity
         // Free Crafting: when a recipe stays selected at a crafting station,
         // queue the missing materials through the normal Add Item path.
         bool  freeCraft    = false;
+        // Infinite Quick-Use Items: items on the quick-use bar are not used up.
+        bool  infQuickUse  = false;
 
         // Mount & Pet Options (menu.cpp). Controls Pet registration capacity
         // and pet hire limit up to 999 slots.

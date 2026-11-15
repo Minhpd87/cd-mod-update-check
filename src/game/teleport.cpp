@@ -2281,10 +2281,12 @@ namespace trinity::game
         {
             g_travelFn = reinterpret_cast<TravelFn>(travel);
         }
-        else
+        else if (!core::IsRowRecordTableLayout())
         {
             LOG_ERR("teleport: fast-travel trigger signature NOT FOUND - fast-travel menu disabled.");
         }
+        // PE 3663+: there is no native travel trigger to find; the fast-travel
+        // menu teleports to the waypoint coordinates instead (logged below).
 
         if (core::IsRowRecordTableLayout())
         {
@@ -2295,7 +2297,7 @@ namespace trinity::game
             if (Inventory::FindTableLookup3663(kStr_LevelNameTable, &fn, &g_lvlRegistryGlobal))
                 g_lvlResolver = reinterpret_cast<TableResolve_t>(fn);
             if (g_sceneResolver)
-                LOG_OK("teleport: scene registry (3663) lookup %p global %p; travel via coordinate teleport.",
+                LOG_OK("teleport: fast-travel menu ready (coordinate teleport; scene registry lookup %p global %p).",
                        reinterpret_cast<void*>(g_sceneResolver), reinterpret_cast<void*>(g_registryGlobal));
             else
                 LOG_ERR("teleport: scene-registry resolver NOT FOUND - fast-travel menu disabled.");

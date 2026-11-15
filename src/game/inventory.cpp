@@ -55,6 +55,8 @@ namespace trinity::game
         // Free Crafting (defined at the end of this file).
         void FreeCraftInstall();
         void FreeCraftRemove();
+        void QuickUseInstall();
+        void QuickUseRemove();
         void FreeCraftTick();
     }
 
@@ -3640,6 +3642,7 @@ namespace trinity::game
             g_locMgrGlobal = mem::ResolveRipAt(locGet + kOff_LocGet_MovGlobal, 7);
 
         FreeCraftInstall();
+        QuickUseInstall();
         return true;
     }
 
@@ -3650,6 +3653,7 @@ namespace trinity::game
         if (g_stackApplied) { SetAllMaxStackSizes(false, 0); g_stackApplied = false; }
         if (g_slotApplied)  { SetAllSlotSizes(false, 0);     g_slotApplied  = false; }
         FreeCraftRemove();
+        QuickUseRemove();
 
         mem::RemoveHook(&g_qtyTarget);
         if (g_commitPlacementTarget)
@@ -9136,6 +9140,94 @@ namespace trinity::game
             mem::RemoveHook(&g_refineFindTarget);
             mem::RemoveHook(&g_kukuNodeSelectTarget);
             // The cave page stays: a thread may still be inside it.
+        }
+
+        // Infinite Quick-Use Items (PE 3663, live-traced 2026-11-15): eating
+        // from the quick-use bar or the inventory screen both reach the server
+        // removal pass f(txn, out): txn+0x18 = records (stride 0xE0, each a
+        // TrItemValue: type u16 +0x08, quantity i64 +0x10 = amount to take),
+        // txn+0x20 = u32 count. Zero the amount for records whose item type
+        // sits on the quick-use bar.
+        //
+        // The quick-use bar lives in the player's EquipSlotActorComponent
+        // (owner +0x68 -> actor, actor +0x38 -> comp), in a second array beside
+        // the gear table: comp+0x58 -> records (stride 0x110: u16 slot no +0x00,
+        // TrItemValue +0x08, so item type at +0x10), u32 count at comp+0x60.
+        // Slots below 0x0E hold other gear (slot 0 even holds the money
+        // item), so only slot numbers from 0x0E up count as the quick-use bar.
+        constexpr uint16_t kQuickUseFirstSlot = 0x0E;
+
+        bool IsOnQuickUseBar(uint16_t type)
+        {
+            if (type == 0 || type == kInvSlot_EmptyType) return false;
+            uintptr_t owner = Player::GetControlledOwner(), actor = 0, comp = 0, recs = 0;
+            uint32_t n = 0;
+            if (owner < kMinPointer || !mem::ReadPtr(owner + kOff_Owner_Actor, &actor) || actor < kMinPointer ||
+                !mem::ReadPtr(actor + 0x38, &comp) || comp < kMinPointer ||
+                !mem::ReadPtr(comp + 0x58, &recs) || recs < kMinPointer ||
+                !mem::Read32(comp + 0x60, &n) || n == 0 || n > 64)
+                return false;
+            for (uint32_t i = kQuickUseFirstSlot; i < n; ++i)
+            {
+                const uintptr_t r = recs + static_cast<uintptr_t>(i) * 0x110;
+                uint16_t slot = 0, t = 0;
+                if (!mem::Read16(r, &slot) || !mem::Read16(r + 0x10, &t)) return false;
+                if (slot >= kQuickUseFirstSlot && t == type) return true;
+            }
+            return false;
+        }
+        constexpr const char* kSig_ApplyRemovals =
+            "48 89 5C 24 10 48 89 6C 24 18 56 57 41 56 48 83 EC 30 48 8B F9 4C 8B F2 48 8B 49 10 E8";
+        using ApplyRemovals_t = uint32_t*(__fastcall*)(uintptr_t txn, uint32_t* out);
+        ApplyRemovals_t oApplyRemovals = nullptr;
+        void* g_applyRemovalsTarget = nullptr;
+        std::atomic<int> g_quickUseLogLeft{ 8 };
+
+        void SpareEquippedRemovals(uintptr_t txn)
+        {
+            uintptr_t recs = 0;
+            uint32_t n = 0;
+            if (!mem::ReadPtr(txn + 0x18, &recs) || recs < kMinPointer ||
+                !mem::Read32(txn + 0x20, &n) || n == 0 || n > 64)
+                return;
+            for (uint32_t i = 0; i < n; ++i)
+            {
+                const uintptr_t r = recs + static_cast<uintptr_t>(i) * 0xE0;
+                uint16_t type = 0;
+                int64_t qty = 0;
+                if (!mem::Read16(r + kOff_InvSlot_TypeId, &type) || !mem::Read64(r + kOff_InvSlot_Quantity, &qty))
+                    continue;
+                const bool equipped = qty > 0 && IsOnQuickUseBar(type);
+                if (g_quickUseLogLeft.load() > 0)
+                {
+                    --g_quickUseLogLeft;
+                    LOG_INFO("quickuse: removal type=0x%04X qty=%lld onBar=%d", type, (long long)qty, equipped ? 1 : 0);
+                }
+                if (equipped)
+                    *reinterpret_cast<int64_t*>(r + kOff_InvSlot_Quantity) = 0;
+            }
+        }
+
+        uint32_t* __fastcall hkApplyRemovals(uintptr_t txn, uint32_t* out)
+        {
+            if (State::Get().infQuickUse && txn)
+            {
+                __try { SpareEquippedRemovals(txn); }
+                __except (EXCEPTION_EXECUTE_HANDLER) {}
+            }
+            return oApplyRemovals(txn, out);
+        }
+
+        void QuickUseInstall()
+        {
+            mem::InstallHook("quickuse: apply removals", kSig_ApplyRemovals,
+                             "Infinite Quick-Use Items unavailable",
+                             &hkApplyRemovals, &oApplyRemovals, &g_applyRemovalsTarget, 1);
+        }
+
+        void QuickUseRemove()
+        {
+            mem::RemoveHook(&g_applyRemovalsTarget);
         }
 
         // Take `qty` units of `type` back out of the pack: lower stacks (or

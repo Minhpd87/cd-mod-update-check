@@ -127,8 +127,14 @@ namespace trinity::core
                          "Crimson Desert TU 1.18.02 (Active)");
             }
 
-            g_versionInfo.isSupported = true;
-            LOG_OK("version: Game version detected: %s [PE: %s]", g_versionInfo.displayStr, g_versionInfo.rawVersionStr);
+            // Current-build-only policy: the TU names above describe old layouts;
+            // what is shown and supported is the exact PE build.
+            constexpr uint16_t kSupportedRevision = 3663;
+            g_versionInfo.isSupported = (g_versionInfo.revision == kSupportedRevision);
+            snprintf(g_versionInfo.displayStr, sizeof(g_versionInfo.displayStr),
+                     g_versionInfo.isSupported ? "Game PE %s (Supported)" : "Game PE %s (Unsupported - built for 3663)",
+                     g_versionInfo.rawVersionStr);
+            LOG_OK("version: %s", g_versionInfo.displayStr);
         }
     }
 

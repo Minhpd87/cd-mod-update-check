@@ -124,7 +124,7 @@ namespace trinity::gui
         changed |= ui::Toggle(LOC("No Fall Damage"), &st.noFallDamage,
                    LOC("Completely negates fall damage from high drops, cliffs, and Sky Arrival teleport."));
         if (ui::Toggle(LOC("Infinite Stamina & Mount"), &st.infStamina,
-                   LOC("Sprint, dodge, climb, and gallop on horses/mounts with unlimited stamina.")))
+                   LOC("Sprint, dodge, climb, and gallop on horses/mounts with unlimited stamina. Also keeps underwater breath full.")))
         {
             st.infMountStamina = st.infStamina;
             changed = true;
@@ -2169,6 +2169,9 @@ namespace trinity::gui
         if (ui::Toggle(LOC("Free Crafting"), &st.freeCraft,
                        LOC("Crafting costs nothing: selecting a recipe at a crafting station adds any missing materials, and whatever a craft uses is given back right after.")))
             changed = true;
+        if (ui::Toggle(LOC("Infinite Quick-Use Items"), &st.infQuickUse,
+                       LOC("Food and other items placed on the quick-use bar are not used up. Items not on the bar are consumed as normal.")))
+            changed = true;
 
         if (changed && st.autoSave)
             Settings::Save();
@@ -3689,7 +3692,9 @@ namespace trinity::gui
 
         // Detected Game Version Information
         const char* verStr = core::GetGameVersionDisplay();
-        ui::Option(verStr, LOC("Game version automatically detected by Trinity engine."));
+        ui::Option(verStr, core::GetGameVersion().isSupported
+                   ? LOC("Detected game build. This Trinity build supports PE 1.0.0.3663.")
+                   : LOC("Detected game build is not PE 1.0.0.3663. Features may fail or crash; update Trinity for this build."));
 
         // Detected Controller Information
         if (hooks::IsDualSenseConnected())
