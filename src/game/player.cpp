@@ -598,6 +598,42 @@ namespace trinity::game
         // below require OUR keyboard/gamepad timestamps.
         using JustWindowEval_t = uint8_t (__fastcall*)(void* mgr, void* buf, float aux,
                                                        uint8_t isGuard, bool* outWindows);
+        // Underwater breath (PE 3663): stat type 27, base 120000 = 120 s of air.
+        // Diving swaps its rate (+0x10) to -1000/s and the value is computed on
+        // read by this generic getter: cur(+0x08) + elapsed*rate, clamped to
+        // [+0x28, base(+0x18)+bonus(+0x20)]. Writing the client entry's rate does
+        // not stop the HUD/server drain, so answer the getter itself.
+        constexpr const char* kSig_StatValueAt =
+            "48 89 5C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 EC 20 4D 8B F1 "
+            "49 8B F0 48 8B FA 48 8B D9 E8 ?? ?? ?? ?? 80 78 1A 02";
+        constexpr int32_t kStatType_Breath = 27;
+        using StatValueAt_t = int64_t*(__fastcall*)(uintptr_t entry, int64_t* out, uint64_t now, uint16_t* frac);
+        StatValueAt_t oStatValueAt = nullptr;
+        void* g_statValueAtTarget = nullptr;
+
+        int64_t* __fastcall hkStatValueAt(uintptr_t entry, int64_t* out, uint64_t now, uint16_t* frac)
+        {
+            int64_t* r = oStatValueAt(entry, out, now, frac);
+            if (State::Get().infStamina && entry && r)
+            {
+                __try
+                {
+                    if (*reinterpret_cast<const int32_t*>(entry) == kStatType_Breath)
+                    {
+                        const int64_t full = *reinterpret_cast<const int64_t*>(entry + 0x18) +
+                                             *reinterpret_cast<const int64_t*>(entry + 0x20);
+                        if (full > 0 && full < 1000000000LL && *r < full)
+                        {
+                            *r = full;
+                            if (frac) *frac = 0;
+                        }
+                    }
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER) {}
+            }
+            return r;
+        }
+
         JustWindowEval_t oJustWindowEval   = nullptr;
         void*            g_justEvalTarget  = nullptr;
         std::atomic<ULONGLONG> g_lastGuardInputMs{ 0 };
@@ -2140,6 +2176,10 @@ namespace trinity::game
         else
             LOG_OK("player: just-window-eval hook installed @ %p (easy parry/evade live)", g_justEvalTarget);
 
+        // Infinite Stamina also covers underwater breath (type 27).
+        mem::InstallHook("player: stat value-at (breath)", kSig_StatValueAt, "Infinite Stamina will not cover underwater breath",
+                         &hkStatValueAt, &oStatValueAt, &g_statValueAtTarget, 2);
+
         return true;
     }
 
@@ -2299,6 +2339,7 @@ namespace trinity::game
         g_damageBuffVtable = 0;
         g_damageDefinition = nullptr;
         mem::RemoveHook(&g_justEvalTarget);
+        mem::RemoveHook(&g_statValueAtTarget);
 
         ClearPlayerSets();
 
