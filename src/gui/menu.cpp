@@ -2167,7 +2167,7 @@ namespace trinity::gui
                           LOC("Enter custom max stack size using keyboard or arrow keys (Press ENTER to type).")))
             changed = true;
         if (ui::Toggle(LOC("Free Crafting"), &st.freeCraft,
-                       LOC("Crafting costs nothing: selecting a recipe at a crafting station adds any missing materials, and whatever a craft uses is given back right after.")))
+                       LOC("Crafting costs nothing: selecting a recipe at a crafting station adds enough materials for at least 10 crafts, and whatever a craft uses is given back right after.")))
             changed = true;
         if (ui::Toggle(LOC("Infinite Quick-Use Items"), &st.infQuickUse,
                        LOC("Food and other items placed on the quick-use bar are not used up. Items not on the bar are consumed as normal.")))

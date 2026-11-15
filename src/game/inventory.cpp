@@ -8774,7 +8774,10 @@ namespace trinity::game
         // First material the pack is short of for `recipe`: its type and the
         // missing amount. For a group slot any single member that already
         // covers the amount satisfies it; otherwise the group's first member
-        // (the one the station shows) is topped up.
+        // (the one the station shows) is topped up. Amounts are scaled by
+        // kFreeCraftBatch so the player can craft that many in one go.
+        constexpr int64_t kFreeCraftBatch = 10;
+
         bool FirstShortfall(uint16_t recipe, uint16_t skip, uint16_t* outType, int64_t* outQty)
         {
             const uintptr_t r = TableEntry(g_recipeTableGlob, recipe);
@@ -8792,6 +8795,7 @@ namespace trinity::game
                     int64_t  need = 0;
                     if (!Read16(e, &type) || type == 0xFFFF || type == skip || !Read64(e + 8, &need)) continue;
                     if (need < 1 || need > 9999) continue;
+                    need *= kFreeCraftBatch;
                     const int64_t have = PackCount(type);
                     if (have < 0) return false;
                     if (have < need) { *outType = type; *outQty = need - have; return true; }
@@ -8809,6 +8813,7 @@ namespace trinity::game
                     int64_t  need = 0;
                     if (!Read16(e, &grp) || grp == 0xFFFF || !Read64(e + 8, &need)) continue;
                     if (need < 1 || need > 9999) continue;
+                    need *= kFreeCraftBatch;
                     const uintptr_t g = TableEntry(g_groupTableGlob, grp);
                     uintptr_t memb = 0;
                     uint32_t  mn  = 0;
