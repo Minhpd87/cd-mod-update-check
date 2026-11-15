@@ -9153,35 +9153,39 @@ namespace trinity::game
         // (owner +0x68 -> actor, actor +0x38 -> comp), in a second array beside
         // the gear table: comp+0x58 -> records (stride 0x110: u16 slot no +0x00,
         // TrItemValue +0x08, so item type at +0x10), u32 count at comp+0x60.
-        // Slots below 0x0E hold other gear (slot 0 even holds the money
-        // item), so only slot numbers from 0x0E up count as the quick-use bar.
+        // Slot 0 is the equipped ammo slot (arrows, type 1 on PE 3663), slots
+        // 1-0x0D hold other gear, and slot numbers from 0x0E up are the
+        // quick-use bar.
+        constexpr uint16_t kAmmoSlot = 0x00;
         constexpr uint16_t kQuickUseFirstSlot = 0x0E;
 
-        bool IsOnQuickUseBar(uint16_t type)
+        // Equip slot number holding `type`, or -1.
+        int FindEquipSlotOfType(uint16_t type)
+
         {
-            if (type == 0 || type == kInvSlot_EmptyType) return false;
+            if (type == 0 || type == kInvSlot_EmptyType) return -1;
             uintptr_t owner = Player::GetControlledOwner(), actor = 0, comp = 0, recs = 0;
             uint32_t n = 0;
             if (owner < kMinPointer || !mem::ReadPtr(owner + kOff_Owner_Actor, &actor) || actor < kMinPointer ||
                 !mem::ReadPtr(actor + 0x38, &comp) || comp < kMinPointer ||
                 !mem::ReadPtr(comp + 0x58, &recs) || recs < kMinPointer ||
                 !mem::Read32(comp + 0x60, &n) || n == 0 || n > 64)
-                return false;
-            for (uint32_t i = kQuickUseFirstSlot; i < n; ++i)
+                return -1;
+            for (uint32_t i = 0; i < n; ++i)
             {
                 const uintptr_t r = recs + static_cast<uintptr_t>(i) * 0x110;
                 uint16_t slot = 0, t = 0;
-                if (!mem::Read16(r, &slot) || !mem::Read16(r + 0x10, &t)) return false;
-                if (slot >= kQuickUseFirstSlot && t == type) return true;
+                if (!mem::Read16(r, &slot) || !mem::Read16(r + 0x10, &t)) return -1;
+                if (slot != 0xFFFF && t == type) return slot;
             }
-            return false;
+            return -1;
         }
         constexpr const char* kSig_ApplyRemovals =
             "48 89 5C 24 10 48 89 6C 24 18 56 57 41 56 48 83 EC 30 48 8B F9 4C 8B F2 48 8B 49 10 E8";
         using ApplyRemovals_t = uint32_t*(__fastcall*)(uintptr_t txn, uint32_t* out);
         ApplyRemovals_t oApplyRemovals = nullptr;
         void* g_applyRemovalsTarget = nullptr;
-        std::atomic<int> g_quickUseLogLeft{ 8 };
+        std::atomic<int> g_quickUseLogLeft{ 16 };
 
         // Money is resolved by key (type ids are not fixed: type 1 is arrows on PE 3663).
         uint16_t MoneyTypeId()
@@ -9209,13 +9213,15 @@ namespace trinity::game
                 const State& st = State::Get();
                 // Infinite Items: every stackable item except money;
                 // gear (stack 1) is left alone so equip/move paths cannot duplicate it.
+                const int slot = (st.infQuickUse || st.infAmmo) ? FindEquipSlotOfType(type) : -1;
                 const bool spare = qty > 0 &&
-                    ((st.infQuickUse && IsOnQuickUseBar(type)) ||
+                    ((st.infQuickUse && slot >= kQuickUseFirstSlot) ||
+                     (st.infAmmo && slot == kAmmoSlot) ||
                      (st.infItems && type != MoneyTypeId() && IsTypeStackable(type)));
                 if (g_quickUseLogLeft.load() > 0)
                 {
                     --g_quickUseLogLeft;
-                    LOG_INFO("quickuse: removal type=0x%04X qty=%lld spared=%d", type, (long long)qty, spare ? 1 : 0);
+                    LOG_INFO("quickuse: removal type=0x%04X qty=%lld slot=%d spared=%d", type, (long long)qty, slot, spare ? 1 : 0);
                 }
                 if (spare)
                     *reinterpret_cast<int64_t*>(r + kOff_InvSlot_Quantity) = 0;
@@ -9224,7 +9230,7 @@ namespace trinity::game
 
         uint32_t* __fastcall hkApplyRemovals(uintptr_t txn, uint32_t* out)
         {
-            if ((State::Get().infQuickUse || State::Get().infItems) && txn)
+            if ((State::Get().infQuickUse || State::Get().infItems || State::Get().infAmmo) && txn)
             {
                 __try { SpareEquippedRemovals(txn); }
                 __except (EXCEPTION_EXECUTE_HANDLER) {}

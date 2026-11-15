@@ -2175,6 +2175,9 @@ namespace trinity::gui
         if (ui::Toggle(LOC("Infinite Items"), &st.infItems,
                        LOC("Using or discarding any stackable item never lowers its count. Money and gear are not affected.")))
             changed = true;
+        if (ui::Toggle(LOC("Infinite Ammo"), &st.infAmmo,
+                       LOC("Whatever is in the equipped ammo slot (arrows, poison or explosive arrows, bullets) is not used up.")))
+            changed = true;
 
         if (changed && st.autoSave)
             Settings::Save();

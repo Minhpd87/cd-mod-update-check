@@ -125,6 +125,7 @@ namespace trinity
             else if (!strcmp(key, "freeCraft"))           vals.freeCraft           = atoi(val) != 0;
             else if (!strcmp(key, "infQuickUse"))         vals.infQuickUse         = atoi(val) != 0;
             else if (!strcmp(key, "infItems"))            vals.infItems            = atoi(val) != 0;
+            else if (!strcmp(key, "infAmmo"))             vals.infAmmo             = atoi(val) != 0;
             else if (!strcmp(key, "petSlotLimit"))        vals.petSlotLimit        = atoi(val) != 0;
             else if (!strcmp(key, "petSlotLimitVal"))     vals.petSlotLimitVal     = atoi(val);
             else if (!strcmp(key, "invSlotSize"))         vals.invSlotSize         = atoi(val) != 0;
@@ -308,6 +309,7 @@ namespace trinity
         st.freeCraft     = vals.freeCraft;
         st.infQuickUse   = vals.infQuickUse;
         st.infItems      = vals.infItems;
+        st.infAmmo       = vals.infAmmo;
         st.petSlotLimit    = vals.petSlotLimit;
         st.petSlotLimitVal = ClampI(vals.petSlotLimitVal, 30, 999);
         st.invSlotSize     = vals.invSlotSize;
@@ -416,6 +418,7 @@ namespace trinity
                 "freeCraft=%d\n"
                 "infQuickUse=%d\n"
                 "infItems=%d\n"
+                "infAmmo=%d\n"
                 "petSlotLimit=%d\n"
                 "petSlotLimitVal=%d\n"
                 "invSlotSize=%d\n"
@@ -509,6 +512,7 @@ namespace trinity
                 st.freeCraft ? 1 : 0,
                 st.infQuickUse ? 1 : 0,
                 st.infItems ? 1 : 0,
+                st.infAmmo ? 1 : 0,
                 st.petSlotLimit ? 1 : 0,
                 st.petSlotLimitVal,
                 st.invSlotSize ? 1 : 0,

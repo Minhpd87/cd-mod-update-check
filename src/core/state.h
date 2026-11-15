@@ -142,6 +142,8 @@ namespace trinity
         bool  infQuickUse  = false;
         // Infinite Items: using or discarding stackable items never lowers them.
         bool  infItems     = false;
+        // Infinite Ammo: whatever sits in the equipped ammo slot is not used up.
+        bool  infAmmo      = false;
 
         // Mount & Pet Options (menu.cpp). Controls Pet registration capacity
         // and pet hire limit up to 999 slots.
