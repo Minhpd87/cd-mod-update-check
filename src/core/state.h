@@ -140,6 +140,8 @@ namespace trinity
         bool  freeCraft    = false;
         // Infinite Quick-Use Items: items on the quick-use bar are not used up.
         bool  infQuickUse  = false;
+        // Infinite Items: using or discarding stackable items never lowers them.
+        bool  infItems     = false;
 
         // Mount & Pet Options (menu.cpp). Controls Pet registration capacity
         // and pet hire limit up to 999 slots.

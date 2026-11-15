@@ -9183,6 +9183,15 @@ namespace trinity::game
         void* g_applyRemovalsTarget = nullptr;
         std::atomic<int> g_quickUseLogLeft{ 8 };
 
+        // Money is resolved by key (type ids are not fixed: type 1 is arrows on PE 3663).
+        uint16_t MoneyTypeId()
+        {
+            static std::atomic<uint16_t> s_tid{ 0 };
+            uint16_t t = s_tid.load();
+            if (!t) { t = Inventory::FindTypeIdByKey("Money_Copper"); s_tid.store(t); }
+            return t;
+        }
+
         void SpareEquippedRemovals(uintptr_t txn)
         {
             uintptr_t recs = 0;
@@ -9197,20 +9206,25 @@ namespace trinity::game
                 int64_t qty = 0;
                 if (!mem::Read16(r + kOff_InvSlot_TypeId, &type) || !mem::Read64(r + kOff_InvSlot_Quantity, &qty))
                     continue;
-                const bool equipped = qty > 0 && IsOnQuickUseBar(type);
+                const State& st = State::Get();
+                // Infinite Items: every stackable item except money;
+                // gear (stack 1) is left alone so equip/move paths cannot duplicate it.
+                const bool spare = qty > 0 &&
+                    ((st.infQuickUse && IsOnQuickUseBar(type)) ||
+                     (st.infItems && type != MoneyTypeId() && IsTypeStackable(type)));
                 if (g_quickUseLogLeft.load() > 0)
                 {
                     --g_quickUseLogLeft;
-                    LOG_INFO("quickuse: removal type=0x%04X qty=%lld onBar=%d", type, (long long)qty, equipped ? 1 : 0);
+                    LOG_INFO("quickuse: removal type=0x%04X qty=%lld spared=%d", type, (long long)qty, spare ? 1 : 0);
                 }
-                if (equipped)
+                if (spare)
                     *reinterpret_cast<int64_t*>(r + kOff_InvSlot_Quantity) = 0;
             }
         }
 
         uint32_t* __fastcall hkApplyRemovals(uintptr_t txn, uint32_t* out)
         {
-            if (State::Get().infQuickUse && txn)
+            if ((State::Get().infQuickUse || State::Get().infItems) && txn)
             {
                 __try { SpareEquippedRemovals(txn); }
                 __except (EXCEPTION_EXECUTE_HANDLER) {}

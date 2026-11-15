@@ -2172,6 +2172,9 @@ namespace trinity::gui
         if (ui::Toggle(LOC("Infinite Quick-Use Items"), &st.infQuickUse,
                        LOC("Food and other items placed on the quick-use bar are not used up. Items not on the bar are consumed as normal.")))
             changed = true;
+        if (ui::Toggle(LOC("Infinite Items"), &st.infItems,
+                       LOC("Using or discarding any stackable item never lowers its count. Money and gear are not affected.")))
+            changed = true;
 
         if (changed && st.autoSave)
             Settings::Save();
